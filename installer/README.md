@@ -27,7 +27,7 @@ curl -sS -X POST "http://127.0.0.1:7077" -H "Content-Type: application/json" --d
 If your backend implements the bootstrap endpoint, users can run:
 
 ```bash
-NANO_POW_API_KEY="<work_api_key>" ./installer/nano-pow one-click
+curl -fsSL https://rpc.nano.to/install/pow.sh | WORK_API_KEY="<work_api_key>" bash
 ```
 
 This auto-provisions tunnel settings from `rpc.nano.to`, starts worker + tunnel, and avoids manual SSH details.

@@ -7,6 +7,12 @@ TMP_DIR="$(mktemp -d)"
 TARGET="/usr/local/bin/nano-pow"
 WORKER_BINARY=""
 
+script_dir() {
+  local script_path
+  script_path="${BASH_SOURCE[0]}"
+  cd -- "$(dirname -- "$script_path")" >/dev/null 2>&1 && pwd -P
+}
+
 can_use_sudo() {
   command -v sudo >/dev/null 2>&1 && [[ -t 0 ]]
 }
@@ -112,13 +118,13 @@ detect_arch() {
 install_deps_linux() {
   if command -v apt-get >/dev/null 2>&1; then
     with_sudo apt-get update
-    with_sudo apt-get install -y curl jq openssh-client autossh
+    with_sudo apt-get install -y curl jq openssh-client autossh git
   elif command -v dnf >/dev/null 2>&1; then
-    with_sudo dnf install -y curl jq openssh-clients autossh
+    with_sudo dnf install -y curl jq openssh-clients autossh git
   elif command -v pacman >/dev/null 2>&1; then
-    with_sudo pacman -Sy --noconfirm curl jq openssh autossh
+    with_sudo pacman -Sy --noconfirm curl jq openssh autossh git
   else
-    log "No supported package manager detected; install curl/jq/openssh/autossh manually"
+    log "No supported package manager detected; install curl/jq/openssh/autossh/git manually"
   fi
 }
 
@@ -139,37 +145,63 @@ download_cli() {
   fi
 }
 
-download_worker_if_available() {
-  local os="$1"
-  local arch="$2"
-  if [[ "$os" != "mac" || "$arch" != "arm64" ]]; then
-    return
+prepare_worker_source() {
+  local source_base="$HOME/.local/share/nano-pow/source"
+  local source_root="$source_base/nano-work-server"
+  local work_repo_url="${NANO_POW_WORK_REPO_URL:-https://github.com/nanocurrency/nano-work-server.git}"
+  local bundled_source="${NANO_POW_BUNDLED_WORK_SOURCE_DIR:-}"
+
+  if [[ -z "$bundled_source" ]]; then
+    local candidate
+    candidate="$(script_dir)/../nano-work-server"
+    if [[ -f "$candidate/Cargo.toml" ]]; then
+      bundled_source="$candidate"
+    fi
   fi
 
-  local worker_dir="$HOME/.local/share/nano-pow"
-  local worker_path="$worker_dir/NanoPoW"
-  local bundle_tar="$TMP_DIR/m3-nano-pow_NanoPoW.bundle.tar.gz"
-  mkdir -p "$worker_dir"
-  if curl -fsSL "${REPO_RAW_BASE}/worker/macos-arm64" -o "$worker_path"; then
-    chmod +x "$worker_path"
-    if curl -fsSL "${REPO_RAW_BASE}/worker/macos-arm64-bundle" -o "$bundle_tar"; then
-      tar -xzf "$bundle_tar" -C "$worker_dir"
-      log "Downloaded worker resource bundle to $worker_dir"
-    else
-      log "Worker resource bundle download unavailable; worker may fail to start"
-    fi
-    WORKER_BINARY="$worker_path"
-    export NANO_POW_WORKER_BINARY="$worker_path"
-    log "Downloaded worker runtime to $worker_path"
-  else
-    rm -f "$worker_path"
-    log "Worker runtime download unavailable; setup will try local build"
+  if command -v nano-work-server >/dev/null 2>&1; then
+    export NANO_POW_WORKER_BINARY="$(command -v nano-work-server)"
+    log "Using existing system worker binary: $NANO_POW_WORKER_BINARY"
+    return 0
   fi
+
+  if [[ -f "$source_root/Cargo.toml" ]]; then
+    export NANO_POW_SOURCE_DIR="$source_root"
+    log "Using existing worker source tree: $source_root"
+    return 0
+  fi
+
+  mkdir -p "$source_base"
+
+  if [[ -n "$bundled_source" && -f "$bundled_source/Cargo.toml" ]]; then
+    rm -rf "$source_root"
+    mkdir -p "$source_root"
+    cp -R "$bundled_source/." "$source_root/"
+    rm -rf "$source_root/.git"
+    log "Copied bundled worker source from $bundled_source"
+  elif [[ -d "$source_root/.git" ]]; then
+    log "Updating worker source from $work_repo_url"
+    if ! GIT_TERMINAL_PROMPT=0 git -C "$source_root" pull --ff-only; then
+      log "Failed to update worker source from $work_repo_url"
+      return 1
+    fi
+  else
+    rm -rf "$source_root"
+    log "Cloning worker source from $work_repo_url"
+    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$work_repo_url" "$source_root"; then
+      log "Failed to clone worker source from $work_repo_url"
+      return 1
+    fi
+  fi
+
+  export NANO_POW_SOURCE_DIR="$source_root"
+  log "Prepared worker source at $NANO_POW_SOURCE_DIR"
 }
 
 main() {
   local os
   local arch
+  local resolved_api_key
   os="$(detect_os)"
   arch="$(detect_arch)"
   log "Detected OS: ${os}"
@@ -185,11 +217,12 @@ main() {
 
   log "Installing nano-pow CLI to $TARGET"
   download_cli
-  download_worker_if_available "$os" "$arch"
+  prepare_worker_source
   ensure_user_path
 
-  if [[ -n "${WORK_API_KEY:-}" && -z "${NANO_POW_API_KEY:-}" ]]; then
-    export NANO_POW_API_KEY="$WORK_API_KEY"
+  resolved_api_key="${NANO_POW_API_KEY:-${WORK_API_KEY:-${API_KEY:-}}}"
+  if [[ -n "$resolved_api_key" ]]; then
+    export NANO_POW_API_KEY="$resolved_api_key"
   fi
 
   log "Starting one-click provisioning"

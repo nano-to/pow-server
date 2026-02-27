@@ -66,6 +66,75 @@ detect_platform() {
   esac
 }
 
+nano_pow_script_dir() {
+  local script_path
+  script_path="${BASH_SOURCE[0]}"
+  cd -- "$(dirname -- "$script_path")" >/dev/null 2>&1 && pwd -P
+}
+
+nano_pow_source_root() {
+  local candidate
+
+  if [[ -n "${NANO_POW_SOURCE_DIR:-}" && ( -f "${NANO_POW_SOURCE_DIR}/CMakeLists.txt" || -f "${NANO_POW_SOURCE_DIR}/Cargo.toml" ) ]]; then
+    printf "%s" "${NANO_POW_SOURCE_DIR}"
+    return 0
+  fi
+
+  if [[ -f "$PWD/CMakeLists.txt" || -f "$PWD/Cargo.toml" ]]; then
+    printf "%s" "$PWD"
+    return 0
+  fi
+
+  candidate="$(nano_pow_script_dir)/.."
+  if [[ -f "$candidate/CMakeLists.txt" || -f "$candidate/Cargo.toml" ]]; then
+    printf "%s" "$candidate"
+    return 0
+  fi
+
+  candidate="$(nano_pow_script_dir)/../nano-work-server"
+  if [[ -f "$candidate/Cargo.toml" ]]; then
+    printf "%s" "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+nano_work_server_binary_name() {
+  printf "nano-work-server"
+}
+
+is_nano_work_server_binary() {
+  local path="$1"
+  [[ "$(basename "$path")" == "$(nano_work_server_binary_name)" ]]
+}
+
+nano_work_server_compute_args() {
+  local gpu_override="${NANO_POW_GPU:-}"
+  local cpu_override="${NANO_POW_CPU_THREADS:-}"
+
+  if [[ -n "$gpu_override" ]]; then
+    printf -- "--gpu %s" "$gpu_override"
+    return
+  fi
+
+  if [[ -n "$cpu_override" ]]; then
+    printf -- "--cpu-threads %s" "$cpu_override"
+    return
+  fi
+
+  case "$GPU_VENDOR" in
+    nvidia|amd|apple)
+      printf -- "--gpu 0:0"
+      ;;
+    *)
+      local cores
+      cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf "1")"
+      printf -- "--cpu-threads %s" "$cores"
+      ;;
+  esac
+}
+
 detect_gpu_vendor() {
   if [[ "$OS" == "mac" ]]; then
     if system_profiler SPDisplaysDataType 2>/dev/null | grep -qi "Apple"; then
@@ -500,8 +569,18 @@ heartbeat_once() {
     fi
   fi
 
+  local worker_args_cfg compute_mode
+  worker_args_cfg="$(cfg_get '.worker.args' 2>/dev/null || printf '')"
+  if [[ "$worker_args_cfg" == *"--gpu"* ]]; then
+    compute_mode="gpu"
+  elif [[ "$worker_args_cfg" == *"--cpu-threads"* ]]; then
+    compute_mode="cpu"
+  else
+    compute_mode="unknown"
+  fi
+
   local payload status_file body_file status
-  payload="{\"workerName\":\"${worker_name}\",\"labels\":\"${labels}\",\"localPort\":${local_port},\"tunnelHost\":\"${tunnel_public_host}\",\"tunnelPort\":\"${remote_port}\",\"tunnelUrl\":\"${tunnel_public_url}\",\"version\":\"${VERSION}\",\"sshPublicKey\":\"${ssh_public_key}\",\"ngrokCredentialId\":\"${ngrok_credential_id}\"}"
+  payload="{\"workerName\":\"${worker_name}\",\"labels\":\"${labels}\",\"localPort\":${local_port},\"tunnelHost\":\"${tunnel_public_host}\",\"tunnelPort\":\"${remote_port}\",\"tunnelUrl\":\"${tunnel_public_url}\",\"version\":\"${VERSION}\",\"sshPublicKey\":\"${ssh_public_key}\",\"ngrokCredentialId\":\"${ngrok_credential_id}\",\"os\":\"${OS}\",\"arch\":\"${ARCH}\",\"gpuVendor\":\"${GPU_VENDOR}\",\"computeMode\":\"${compute_mode}\"}"
   status_file="$RUN_DIR/heartbeat.http"
   body_file="$RUN_DIR/heartbeat.body"
 
@@ -586,6 +665,16 @@ one_click_cmd() {
       --local-port)
         [[ -n "${2:-}" ]] || die "Missing value for --local-port"
         local_port="$2"
+        shift 2
+        ;;
+      --gpu)
+        [[ -n "${2:-}" ]] || die "Missing value for --gpu (e.g. 0:0)"
+        export NANO_POW_GPU="$2"
+        shift 2
+        ;;
+      --cpu-threads|--cpu)
+        [[ -n "${2:-}" ]] || die "Missing value for --cpu-threads"
+        export NANO_POW_CPU_THREADS="$2"
         shift 2
         ;;
       *)
@@ -682,47 +771,221 @@ one_click_cmd() {
 }
 
 worker_binary_path() {
-  if [[ -n "${NANO_POW_WORKER_BINARY:-}" && -x "${NANO_POW_WORKER_BINARY}" ]]; then
+  local source_root
+  source_root="$(nano_pow_source_root 2>/dev/null || printf "")"
+
+  if [[ -n "${NANO_POW_WORKER_BINARY:-}" ]] && worker_binary_compatible "${NANO_POW_WORKER_BINARY}"; then
     printf "%s" "${NANO_POW_WORKER_BINARY}"
     return
   fi
 
-  if [[ "$OS" == "mac" && "$ARCH" == "arm64" && -d "$PWD/lib/m3-nano-pow" ]]; then
-    printf "%s" "$PWD/lib/m3-nano-pow/.build/release/NanoPoW"
+  if [[ "$OS" == "mac" && "$ARCH" == "arm64" && -n "$source_root" && -d "$source_root/lib/m3-nano-pow" ]]; then
+    printf "%s" "$source_root/lib/m3-nano-pow/.build/release/NanoPoW"
     return
   fi
 
-  if [[ -x "$PWD/build/nano_pow_server" ]]; then
-    printf "%s" "$PWD/build/nano_pow_server"
+  if [[ -n "$source_root" && -f "$source_root/Cargo.toml" ]]; then
+    local rust_binary="$source_root/target/release/nano-work-server"
+    if [[ -x "$rust_binary" ]]; then
+      printf "%s" "$rust_binary"
+      return
+    fi
+    local rust_binary_debug="$source_root/target/debug/nano-work-server"
+    if [[ -x "$rust_binary_debug" ]]; then
+      printf "%s" "$rust_binary_debug"
+      return
+    fi
+  fi
+
+  if [[ -n "$source_root" ]] && worker_binary_compatible "$source_root/build/nano_pow_server"; then
+    printf "%s" "$source_root/build/nano_pow_server"
     return
+  fi
+
+  if command -v nano-work-server >/dev/null 2>&1; then
+    local system_worker
+    system_worker="$(command -v nano-work-server)"
+    if worker_binary_compatible "$system_worker"; then
+      printf "%s" "$system_worker"
+      return
+    fi
   fi
 
   if command -v nano_pow_server >/dev/null 2>&1; then
-    command -v nano_pow_server
-    return
+    local system_worker
+    system_worker="$(command -v nano_pow_server)"
+    if worker_binary_compatible "$system_worker"; then
+      printf "%s" "$system_worker"
+      return
+    fi
   fi
 
   printf ""
 }
 
+worker_binary_compatible() {
+  local path="$1"
+  [[ -n "$path" && -x "$path" ]] || return 1
+
+  if [[ "$OS" != "linux" ]]; then
+    return 0
+  fi
+
+  if command -v file >/dev/null 2>&1; then
+    local file_out
+    file_out="$(file -b "$path" 2>/dev/null || printf "")"
+    [[ "$file_out" == *"ELF"* ]] || return 1
+
+    case "$ARCH" in
+      amd64)
+        [[ "$file_out" == *"x86-64"* || "$file_out" == *"x86_64"* ]] || return 1
+        ;;
+      arm64)
+        [[ "$file_out" == *"aarch64"* || "$file_out" == *"ARM aarch64"* ]] || return 1
+        ;;
+    esac
+  fi
+
+  return 0
+}
+
+install_worker_build_deps_linux() {
+  local source_root="$1"
+  local is_rust=false
+
+  if [[ -f "$source_root/Cargo.toml" ]]; then
+    is_rust=true
+  fi
+
+  if [[ "$is_rust" == "true" ]]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+      if command -v apt-get >/dev/null 2>&1; then
+        run_with_sudo apt-get update
+        run_with_sudo apt-get install -y curl build-essential pkg-config libssl-dev
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      elif command -v dnf >/dev/null 2>&1; then
+        run_with_sudo dnf install -y curl gcc gcc-c++ pkgconf-pkg-config openssl-devel
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      elif command -v pacman >/dev/null 2>&1; then
+        run_with_sudo pacman -Sy --noconfirm curl base-devel pkgconf openssl
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      else
+        die "Rust not found. Install Rust from https://rustup.rs"
+      fi
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+      run_with_sudo apt-get update
+      run_with_sudo apt-get install -y ocl-icd-opencl-dev || log_warn "OpenCL not available; GPU work will not be available"
+    elif command -v dnf >/dev/null 2>&1; then
+      run_with_sudo dnf install -y ocl-icd-devel || log_warn "OpenCL not available; GPU work will not be available"
+    fi
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    run_with_sudo apt-get update
+    run_with_sudo apt-get install -y build-essential cmake libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libssl-dev
+  elif command -v dnf >/dev/null 2>&1; then
+    run_with_sudo dnf install -y gcc-c++ make cmake boost-devel openssl-devel
+  elif command -v pacman >/dev/null 2>&1; then
+    run_with_sudo pacman -Sy --noconfirm base-devel cmake boost openssl
+  else
+    die "No supported package manager found. Install build tools manually: cmake, C++ compiler, boost dev headers, openssl dev headers"
+  fi
+}
+
+build_linux_worker_binary() {
+  local source_root="$1"
+  local is_rust=false
+
+  if [[ -f "$source_root/Cargo.toml" ]]; then
+    is_rust=true
+  fi
+
+  if [[ "$is_rust" == "true" ]]; then
+    [[ -n "$source_root" && -f "$source_root/Cargo.toml" ]] || die "Could not locate nano-work-server source tree"
+
+    local build_dir="$source_root/target/release"
+    if [[ -x "$build_dir/nano-work-server" ]]; then
+      log_ok "Rust worker binary already built"
+      return 0
+    fi
+
+    log_info "Building nano-work-server (first run setup)"
+    if [[ -f "$HOME/.cargo/env" ]]; then
+      source "$HOME/.cargo/env"
+    fi
+    cargo build --release --manifest-path "$source_root/Cargo.toml"
+    return 0
+  fi
+
+  local build_dir jobs
+  [[ -n "$source_root" && -f "$source_root/CMakeLists.txt" ]] || die "Could not locate nano_pow_server source tree"
+
+  build_dir="$source_root/build"
+  jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf "2")"
+
+  if [[ -x "$build_dir/nano_pow_server" ]] && ! worker_binary_compatible "$build_dir/nano_pow_server"; then
+    log_warn "Existing build artifact is incompatible with this Linux host; rebuilding from source"
+    rm -rf "$build_dir"
+  fi
+
+  log_info "Building nano_pow_server (first run setup)"
+  cmake -S "$source_root" -B "$build_dir" -DNANO_POW_STANDALONE=ON -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$build_dir" --config Release -j "$jobs"
+}
+
 ensure_worker_binary() {
-  local worker_bin
+  local worker_bin source_root
   worker_bin="$(worker_binary_path)"
   if [[ -n "$worker_bin" && -x "$worker_bin" ]]; then
     log_ok "Worker binary ready: $worker_bin"
     return
   fi
 
-  if [[ "$OS" == "mac" && "$ARCH" == "arm64" && -d "$PWD/lib/m3-nano-pow" ]]; then
+  source_root="$(nano_pow_source_root 2>/dev/null || printf "")"
+
+  if [[ "$OS" == "mac" && "$ARCH" == "arm64" && -n "$source_root" && -d "$source_root/lib/m3-nano-pow" ]]; then
     log_info "Building M3 worker runtime"
-    (cd "$PWD/lib/m3-nano-pow" && swift build -c release)
+    (cd "$source_root/lib/m3-nano-pow" && swift build -c release)
     worker_bin="$(worker_binary_path)"
     [[ -x "$worker_bin" ]] || die "Failed to build M3 worker"
     log_ok "Built M3 worker: $worker_bin"
     return
   fi
 
-  die "No worker binary found. Build nano_pow_server first or run on M3 with lib/m3-nano-pow."
+  if [[ "$OS" == "linux" ]]; then
+    [[ -n "$source_root" ]] || die "No worker binary found and source tree not detected. Run from nano-pow source checkout or set NANO_POW_SOURCE_DIR."
+    install_worker_build_deps_linux "$source_root"
+    build_linux_worker_binary "$source_root"
+    worker_bin="$(worker_binary_path)"
+    [[ -x "$worker_bin" ]] || die "Failed to build worker binary."
+    log_ok "Built worker: $worker_bin"
+    return
+  fi
+
+  if [[ "$OS" == "mac" && -n "$source_root" && -f "$source_root/Cargo.toml" ]]; then
+    log_info "Building nano-work-server for macOS"
+    if command -v cargo >/dev/null 2>&1 || command -v rustc >/dev/null 2>&1; then
+      :
+    else
+      log_warn "Rust not installed; attempting install"
+      if command -v brew >/dev/null 2>&1; then
+        brew install rust || die "Failed to install Rust"
+      fi
+    fi
+    if [[ -f "$HOME/.cargo/env" ]]; then
+      source "$HOME/.cargo/env"
+    fi
+    cargo build --release --manifest-path "$source_root/Cargo.toml"
+    worker_bin="$(worker_binary_path)"
+    [[ -x "$worker_bin" ]] || die "Failed to build nano-work-server for macOS"
+    log_ok "Built nano-work-server: $worker_bin"
+    return
+  fi
+
+  die "No worker binary found. Build nano-work-server first or run on M3 with lib/m3-nano-pow."
 }
 
 write_config() {
@@ -746,6 +1009,15 @@ write_config() {
   local tunnel_public_url="${18:-}"
   local ngrok_credential_id="${19:-}"
   local ngrok_allowed_cidrs="${20:-}"
+
+  local worker_args
+  if is_nano_work_server_binary "$worker_bin"; then
+    worker_args="-l 127.0.0.1:${local_port} $(nano_work_server_compute_args)"
+  elif [[ "$(basename "$worker_bin")" == "NanoPoW" ]]; then
+    worker_args="--port ${local_port}"
+  else
+    worker_args="--config server.log_to_stderr=true"
+  fi
 
   umask 077
   cat > "$CONFIG_FILE" <<EOF
@@ -773,7 +1045,7 @@ write_config() {
   },
   "worker": {
     "binary": "${worker_bin}",
-    "args": "--port ${local_port}"
+    "args": "${worker_args}"
   },
   "createdAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "version": "${VERSION}"
@@ -873,6 +1145,16 @@ setup_cmd() {
         setup_ssh_key_arg="$2"
         shift 2
         ;;
+      --gpu)
+        [[ -n "${2:-}" ]] || die "Missing value for --gpu (e.g. 0:0)"
+        export NANO_POW_GPU="$2"
+        shift 2
+        ;;
+      --cpu-threads|--cpu)
+        [[ -n "${2:-}" ]] || die "Missing value for --cpu-threads"
+        export NANO_POW_CPU_THREADS="$2"
+        shift 2
+        ;;
       *)
         die "Unknown setup flag: $1"
         ;;
@@ -958,13 +1240,24 @@ mac_tunnel_plist_path() {
   printf "%s/Library/LaunchAgents/%s.plist" "$HOME" "$MAC_TUNNEL_LABEL"
 }
 
+args_to_plist_strings() {
+  local args_str="$1"
+  local word
+  for word in $args_str; do
+    printf "      <string>%s</string>\n" "$word"
+  done
+}
+
 write_mac_worker_plist() {
   local worker_bin worker_args
   worker_bin="$(cfg_required '.worker.binary')"
-  worker_args="$(cfg_required '.worker.args')"
+  worker_args="$(cfg_get '.worker.args' 2>/dev/null || printf '')"
   local out_log err_log
   out_log="$LOG_DIR/worker.out.log"
   err_log="$LOG_DIR/worker.err.log"
+
+  local plist_args
+  plist_args="$(args_to_plist_strings "$worker_args")"
 
   cat > "$(mac_worker_plist_path)" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -976,8 +1269,7 @@ write_mac_worker_plist() {
     <key>ProgramArguments</key>
     <array>
       <string>${worker_bin}</string>
-      <string>--port</string>
-      <string>$(cfg_required '.localPort')</string>
+${plist_args}
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -1123,10 +1415,11 @@ write_linux_units() {
   systemd_dir="${HOME}/.config/systemd/user"
   mkdir -p "$systemd_dir"
 
-  local worker_bin local_port host user remote_port ssh_key bind_host provider
+  local worker_bin local_port host user remote_port ssh_key bind_host provider worker_args
   worker_bin="$(cfg_required '.worker.binary')"
   local_port="$(cfg_required '.localPort')"
   provider="$(tunnel_provider)"
+  worker_args="$(cfg_get '.worker.args' 2>/dev/null || printf '')"
 
   cat > "$systemd_dir/$LINUX_WORKER_UNIT" <<EOF
 [Unit]
@@ -1135,7 +1428,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${worker_bin} --config server.log_to_stderr=true
+ExecStart=${worker_bin} ${worker_args}
 Restart=always
 RestartSec=2
 StandardOutput=append:${LOG_DIR}/worker.out.log
@@ -1318,7 +1611,8 @@ heartbeat_recent_success() {
   if [[ "$ts" =~ ^[0-9]+$ ]]; then
     :
   else
-    ts="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || printf "0")"
+    # Try GNU date first (Linux), then BSD date (macOS)
+    ts="$(date -d "$ts" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || printf "0")"
     [[ "$ts" =~ ^[0-9]+$ ]] || return 1
   fi
   age=$(( now - ts ))
@@ -1418,10 +1712,11 @@ start_cmd() {
       fi
       ;;
     windows)
-      local worker_bin host user remote_port local_port ssh_key bind_host provider ngrok_authtoken ngrok_domain ngrok_policy_file_arg
+      local worker_bin worker_args host user remote_port local_port ssh_key bind_host provider ngrok_authtoken ngrok_domain ngrok_policy_file_arg
       worker_bin="$(cfg_required '.worker.binary')"
+      worker_args="$(cfg_get '.worker.args' 2>/dev/null || printf '')"
       local_port="$(cfg_required '.localPort')"
-      nohup "$worker_bin" --port "$local_port" >>"$LOG_DIR/worker.out.log" 2>>"$LOG_DIR/worker.err.log" &
+      nohup "$worker_bin" $worker_args >>"$LOG_DIR/worker.out.log" 2>>"$LOG_DIR/worker.err.log" &
       printf "%s" "$!" > "$RUN_DIR/worker.pid"
       if tunnel_enabled; then
         provider="$(tunnel_provider)"
@@ -1612,10 +1907,10 @@ usage() {
 ${CLI_NAME} v${VERSION}
 
 Usage:
-  ${CLI_NAME} one-click [--api-key KEY] [--local-port N]
+  ${CLI_NAME} one-click [--api-key KEY] [--local-port N] [--gpu PLATFORM:DEVICE] [--cpu-threads N]
   ${CLI_NAME} --tunnel
-  ${CLI_NAME} --local [--port N] [--debug]
-  ${CLI_NAME} setup [--local-only|--no-tunnel] [--local-port N]
+  ${CLI_NAME} --local [--port N] [--gpu PLATFORM:DEVICE] [--cpu-threads N] [--debug]
+  ${CLI_NAME} setup [--local-only|--no-tunnel] [--local-port N] [--gpu PLATFORM:DEVICE] [--cpu-threads N]
                    [--tunnel-host HOST --tunnel-user USER --tunnel-port PORT --ssh-key PATH]
   ${CLI_NAME} start | stop | restart
   ${CLI_NAME} status [--watch]
@@ -1623,6 +1918,12 @@ Usage:
   ${CLI_NAME} doctor
   ${CLI_NAME} uninstall
   ${CLI_NAME} install-cli
+
+Worker compute flags (nano-work-server):
+  --gpu PLATFORM:DEVICE   Use GPU for work generation (e.g. --gpu 0:0)
+  --cpu-threads N         Use N CPU threads for work generation
+  If neither is specified, GPU is auto-detected; falls back to CPU.
+  Can also be set via NANO_POW_GPU or NANO_POW_CPU_THREADS env vars.
 EOF
 }
 
@@ -1636,6 +1937,16 @@ local_run_cmd() {
       --port)
         [[ -n "${2:-}" ]] || die "Missing value for --port"
         port="$2"
+        shift 2
+        ;;
+      --gpu)
+        [[ -n "${2:-}" ]] || die "Missing value for --gpu (e.g. 0:0)"
+        export NANO_POW_GPU="$2"
+        shift 2
+        ;;
+      --cpu-threads|--cpu)
+        [[ -n "${2:-}" ]] || die "Missing value for --cpu-threads"
+        export NANO_POW_CPU_THREADS="$2"
         shift 2
         ;;
       --debug)
@@ -1665,6 +1976,9 @@ local_run_cmd() {
   out_log="$LOG_DIR/local-worker.out.log"
   err_log="$LOG_DIR/local-worker.err.log"
 
+  local compute_args
+  compute_args="$(nano_work_server_compute_args)"
+
   if [[ "$(basename "$worker_bin")" == "NanoPoW" ]]; then
     if [[ "$DEBUG_MODE" == "1" ]]; then
       : > "$out_log"
@@ -1672,6 +1986,14 @@ local_run_cmd() {
       "$worker_bin" --port "$port" >>"$out_log" 2>>"$err_log" &
     else
       "$worker_bin" --port "$port" >/dev/null 2>/dev/null &
+    fi
+  elif is_nano_work_server_binary "$worker_bin"; then
+    if [[ "$DEBUG_MODE" == "1" ]]; then
+      : > "$out_log"
+      : > "$err_log"
+      "$worker_bin" -l "127.0.0.1:$port" $compute_args >>"$out_log" 2>>"$err_log" &
+    else
+      "$worker_bin" -l "127.0.0.1:$port" $compute_args >/dev/null 2>/dev/null &
     fi
   else
     if [[ "$DEBUG_MODE" == "1" ]]; then
