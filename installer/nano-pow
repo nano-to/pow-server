@@ -1,0 +1,1906 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+VERSION="0.1.0"
+CLI_NAME="nano-pow"
+RPC_HOST="${RPC_HOST:-rpc.nano.to}"
+RPC_API_BASE="${RPC_API_BASE:-https://rpc.nano.to}"
+
+OS=""
+ARCH=""
+GPU_VENDOR="unknown"
+LOCAL_WORKER_PID=""
+LOCAL_TUI_STOP="0"
+DEBUG_MODE="0"
+QUIET_MODE="0"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nano-pow"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nano-pow"
+LOG_DIR="${STATE_DIR}/logs"
+RUN_DIR="${STATE_DIR}/run"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+NGROK_POLICY_FILE="${CONFIG_DIR}/ngrok-traffic-policy.json"
+
+MAC_WORKER_LABEL="com.nano.pow.worker"
+MAC_TUNNEL_LABEL="com.nano.pow.tunnel"
+LINUX_WORKER_UNIT="nano-pow-worker.service"
+LINUX_TUNNEL_UNIT="nano-pow-tunnel.service"
+
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+MAGENTA="\033[35m"
+CYAN="\033[36m"
+BOLD="\033[1m"
+RESET="\033[0m"
+
+log_info() { [[ "$QUIET_MODE" == "1" ]] && return 0; printf "%b[INFO]%b %s\n" "$CYAN" "$RESET" "$*"; }
+log_ok() { [[ "$QUIET_MODE" == "1" ]] && return 0; printf "%b[ OK ]%b %s\n" "$GREEN" "$RESET" "$*"; }
+log_warn() { [[ "$QUIET_MODE" == "1" ]] && return 0; printf "%b[WARN]%b %s\n" "$YELLOW" "$RESET" "$*"; }
+log_err() { printf "%b[ERR ]%b %s\n" "$RED" "$RESET" "$*" >&2; }
+die() { log_err "$*"; exit 1; }
+
+need_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+}
+
+detect_platform() {
+  local raw_os
+  raw_os="$(uname -s 2>/dev/null || printf "unknown")"
+  case "$raw_os" in
+    Darwin) OS="mac" ;;
+    Linux) OS="linux" ;;
+    MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
+    *) OS="unknown" ;;
+  esac
+
+  local raw_arch
+  raw_arch="$(uname -m 2>/dev/null || printf "unknown")"
+  case "$raw_arch" in
+    x86_64|amd64) ARCH="amd64" ;;
+    arm64|aarch64) ARCH="arm64" ;;
+    *) ARCH="$raw_arch" ;;
+  esac
+}
+
+detect_gpu_vendor() {
+  if [[ "$OS" == "mac" ]]; then
+    if system_profiler SPDisplaysDataType 2>/dev/null | grep -qi "Apple"; then
+      GPU_VENDOR="apple"
+      return
+    fi
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_VENDOR="nvidia"
+    return
+  fi
+
+  if command -v rocm-smi >/dev/null 2>&1; then
+    GPU_VENDOR="amd"
+    return
+  fi
+
+  if command -v lspci >/dev/null 2>&1; then
+    if lspci | grep -qi nvidia; then
+      GPU_VENDOR="nvidia"
+      return
+    fi
+    if lspci | grep -Eqi "AMD|Advanced Micro Devices"; then
+      GPU_VENDOR="amd"
+      return
+    fi
+  fi
+
+  GPU_VENDOR="none"
+}
+
+is_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]]
+}
+
+run_with_sudo() {
+  if is_root; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "Need root privileges for: $*"
+  fi
+}
+
+read_prompt() {
+  local __var_name="$1"
+  local __prompt="$2"
+  if [[ -r /dev/tty ]] && (: < /dev/tty) 2>/dev/null; then
+    IFS= read -r -p "$__prompt" "$__var_name" < /dev/tty
+  else
+    IFS= read -r -p "$__prompt" "$__var_name"
+  fi
+}
+
+read_secret_prompt() {
+  local __var_name="$1"
+  local __prompt="$2"
+  if [[ -r /dev/tty ]] && (: < /dev/tty) 2>/dev/null; then
+    IFS= read -r -s -p "$__prompt" "$__var_name" < /dev/tty
+  else
+    IFS= read -r -s -p "$__prompt" "$__var_name"
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$RUN_DIR"
+  chmod 700 "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR"
+}
+
+dedicated_ssh_key_path() {
+  printf "%s/.ssh/nano_pow_tunnel_ed25519" "$HOME"
+}
+
+ensure_dedicated_ssh_key() {
+  local ssh_dir ssh_key
+  ssh_dir="$HOME/.ssh"
+  ssh_key="$(dedicated_ssh_key_path)"
+
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+
+  if [[ ! -f "$ssh_key" || ! -f "$ssh_key.pub" ]]; then
+    ssh-keygen -q -t ed25519 -N "" -f "$ssh_key" >/dev/null
+  fi
+
+  chmod 600 "$ssh_key"
+  chmod 644 "$ssh_key.pub"
+  printf "%s" "$ssh_key"
+}
+
+can_auth_tunnel() {
+  local host="$1"
+  local user="$2"
+  local key_path="$3"
+  [[ -n "$host" && -n "$user" && -n "$key_path" && -f "$key_path" ]] || return 1
+  ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i "$key_path" "$user@$host" "exit" >/dev/null 2>&1
+}
+
+select_working_ssh_key_for_tunnel() {
+  local host="$1"
+  local user="$2"
+  local preferred_key="$3"
+
+  if can_auth_tunnel "$host" "$user" "$preferred_key"; then
+    printf "%s" "$preferred_key"
+    return 0
+  fi
+
+  local candidates=(
+    "$HOME/.ssh/id_ed25519"
+    "$HOME/.ssh/id_rsa"
+    "$HOME/.ssh/id_ecdsa"
+  )
+
+  local key
+  for key in "${candidates[@]}"; do
+    if can_auth_tunnel "$host" "$user" "$key"; then
+      printf "%s" "$key"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+random_short_id() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-10
+    return
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 5
+    return
+  fi
+
+  date +%s | tail -c 11
+}
+
+cfg_get() {
+  local key="$1"
+  [[ -f "$CONFIG_FILE" ]] || return 1
+  jq -r "$key" "$CONFIG_FILE"
+}
+
+cfg_required() {
+  local key="$1"
+  local value
+  value="$(cfg_get "$key" 2>/dev/null || true)"
+  [[ -n "$value" && "$value" != "null" ]] || die "Missing config field: $key. Run '$CLI_NAME setup'."
+  printf "%s" "$value"
+}
+
+api_key_present() {
+  local key
+  key="$(cfg_get '.apiKey' 2>/dev/null || true)"
+  [[ -n "$key" && "$key" != "null" ]]
+}
+
+tunnel_enabled() {
+  local enabled
+  enabled="$(cfg_get '.tunnel.enabled' 2>/dev/null || true)"
+  if [[ -z "$enabled" || "$enabled" == "null" ]]; then
+    return 0
+  fi
+  [[ "$enabled" == "true" ]]
+}
+
+tunnel_provider() {
+  local provider
+  provider="$(cfg_get '.tunnel.provider' 2>/dev/null || printf 'reverse-ssh')"
+  if [[ -z "$provider" || "$provider" == "null" ]]; then
+    provider="reverse-ssh"
+  fi
+  printf "%s" "$provider"
+}
+
+discover_ngrok_public_url() {
+  local api url
+  api="$(curl -fsS --max-time 3 "http://127.0.0.1:4040/api/tunnels" 2>/dev/null || printf '')"
+  [[ -n "$api" ]] || return 1
+
+  url="$(jq -r '(.tunnels // [] | map(select((.public_url // "") | startswith("https://"))) | .[0].public_url) // empty' <<<"$api" 2>/dev/null || printf '')"
+  if [[ -z "$url" ]]; then
+    url="$(jq -r '(.tunnels // [])[0].public_url // empty' <<<"$api" 2>/dev/null || printf '')"
+  fi
+
+  [[ -n "$url" ]] || return 1
+  printf "%s" "$url"
+}
+
+validate_payout_address() {
+  local payout="$1"
+  [[ "$payout" =~ ^(nano|xrb)_[13][13456789abcdefghijkmnopqrstuwxyz]{59}$ ]] || [[ "$payout" =~ ^@[a-zA-Z0-9._-]{2,64}$ ]]
+}
+
+mask_key() {
+  local key="$1"
+  local len=${#key}
+  if (( len <= 8 )); then
+    printf "********"
+    return
+  fi
+  printf "%s********%s" "${key:0:4}" "${key: -4}"
+}
+
+install_deps_mac() {
+  if ! command -v brew >/dev/null 2>&1; then
+    die "Homebrew not found. Install Homebrew first: https://brew.sh"
+  fi
+  local missing=()
+  command -v jq >/dev/null 2>&1 || missing+=(jq)
+  command -v autossh >/dev/null 2>&1 || missing+=(autossh)
+  command -v swift >/dev/null 2>&1 || missing+=(swift)
+  if (( ${#missing[@]} > 0 )); then
+    log_info "Installing dependencies via Homebrew: ${missing[*]}"
+    brew install "${missing[@]}"
+  fi
+}
+
+install_deps_linux() {
+  local pkgs=(curl jq openssh-client autossh)
+  if command -v apt-get >/dev/null 2>&1; then
+    run_with_sudo apt-get update
+    run_with_sudo apt-get install -y "${pkgs[@]}"
+  elif command -v dnf >/dev/null 2>&1; then
+    run_with_sudo dnf install -y curl jq openssh-clients autossh
+  elif command -v pacman >/dev/null 2>&1; then
+    run_with_sudo pacman -Sy --noconfirm curl jq openssh autossh
+  else
+    log_warn "No supported package manager found. Install curl, jq, openssh-client, autossh manually."
+  fi
+}
+
+install_deps_windows() {
+  log_warn "Automatic dependency install is not supported in this shell for Windows yet."
+  log_warn "Please install jq, OpenSSH, and autossh manually, then re-run."
+}
+
+install_deps() {
+  detect_platform
+  case "$OS" in
+    mac) install_deps_mac ;;
+    linux) install_deps_linux ;;
+    windows) install_deps_windows ;;
+    *) die "Unsupported OS: $(uname -s)" ;;
+  esac
+}
+
+install_ngrok_if_missing() {
+  if command -v ngrok >/dev/null 2>&1; then
+    return 0
+  fi
+
+  detect_platform
+  log_warn "ngrok not found; attempting automatic install"
+
+  case "$OS" in
+    mac)
+      if ! command -v brew >/dev/null 2>&1; then
+        die "ngrok is required for managed tunnel mode. Install Homebrew, then run: brew install ngrok/ngrok/ngrok"
+      fi
+      if ! brew install ngrok/ngrok/ngrok >/dev/null 2>&1; then
+        brew install ngrok >/dev/null 2>&1 || die "Failed to install ngrok. Install manually: brew install ngrok/ngrok/ngrok"
+      fi
+      ;;
+    linux)
+      if command -v apt-get >/dev/null 2>&1; then
+        run_with_sudo apt-get update
+        run_with_sudo apt-get install -y ngrok || die "Failed to install ngrok via apt. Install manually from https://ngrok.com/download"
+      elif command -v dnf >/dev/null 2>&1; then
+        run_with_sudo dnf install -y ngrok || die "Failed to install ngrok via dnf. Install manually from https://ngrok.com/download"
+      else
+        die "ngrok is required for managed tunnel mode. Install manually from https://ngrok.com/download"
+      fi
+      ;;
+    *)
+      die "ngrok is required for managed tunnel mode. Install manually from https://ngrok.com/download"
+      ;;
+  esac
+
+  command -v ngrok >/dev/null 2>&1 || die "ngrok install did not complete correctly"
+  log_ok "ngrok installed"
+}
+
+install_local_deps() {
+  detect_platform
+  case "$OS" in
+    mac)
+      if ! command -v swift >/dev/null 2>&1; then
+        die "Swift is required for local M3 runtime. Install Xcode command line tools."
+      fi
+      need_cmd curl
+      ;;
+    linux)
+      need_cmd curl
+      ;;
+    windows)
+      need_cmd curl
+      ;;
+    *)
+      die "Unsupported OS: $(uname -s)"
+      ;;
+  esac
+}
+
+install_gpu_drivers_linux() {
+  case "$GPU_VENDOR" in
+    nvidia)
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        log_ok "NVIDIA driver already installed"
+        return
+      fi
+      log_warn "NVIDIA GPU detected but nvidia-smi missing; attempting driver install"
+      if command -v apt-get >/dev/null 2>&1; then
+        run_with_sudo apt-get update
+        run_with_sudo apt-get install -y nvidia-driver-535 || log_warn "Unable to auto-install NVIDIA driver on this distro"
+      elif command -v dnf >/dev/null 2>&1; then
+        run_with_sudo dnf install -y akmod-nvidia || log_warn "Unable to auto-install NVIDIA driver on this distro"
+      else
+        log_warn "Unsupported package manager for NVIDIA auto-install"
+      fi
+      ;;
+    amd)
+      if command -v rocm-smi >/dev/null 2>&1; then
+        log_ok "AMD ROCm tools already installed"
+        return
+      fi
+      log_warn "AMD GPU detected but rocm-smi missing; attempting ROCm install"
+      if command -v apt-get >/dev/null 2>&1; then
+        run_with_sudo apt-get update
+        run_with_sudo apt-get install -y rocm-smi-lib rocm-smi || log_warn "Unable to auto-install ROCm tools"
+      elif command -v dnf >/dev/null 2>&1; then
+        run_with_sudo dnf install -y rocm-smi || log_warn "Unable to auto-install ROCm tools"
+      else
+        log_warn "Unsupported package manager for AMD auto-install"
+      fi
+      ;;
+    none)
+      log_warn "No dedicated GPU detected; using CPU/Metal worker"
+      ;;
+    *)
+      log_warn "GPU vendor '$GPU_VENDOR' does not require Linux driver install"
+      ;;
+  esac
+}
+
+ensure_gpu_readiness() {
+  detect_gpu_vendor
+  case "$OS" in
+    mac)
+      if [[ "$GPU_VENDOR" == "apple" ]]; then
+        log_ok "Apple GPU detected; no driver install needed"
+      else
+        log_warn "No Metal-compatible GPU detected"
+      fi
+      ;;
+    linux) install_gpu_drivers_linux ;;
+    windows)
+      log_warn "GPU driver auto-install not yet implemented for Windows"
+      ;;
+  esac
+}
+
+validate_api_key_remote() {
+  local api_key="$1"
+  local status
+  status="$(curl -sS -o /dev/null -w "%{http_code}" \
+    -X POST "https://${RPC_HOST}/api/account/work-servers/validate-key" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${api_key}" \
+    --data '{}' || true)"
+
+  if [[ "$status" == "200" || "$status" == "204" ]]; then
+    log_ok "API key validated"
+  else
+    log_warn "Could not validate API key online (HTTP ${status:-n/a}); continuing"
+  fi
+}
+
+register_worker_remote() {
+  local api_key="$1"
+  local payout="$2"
+  local bid="$3"
+  local worker_name="$4"
+  local labels="$5"
+
+  curl -sS -o /dev/null \
+    -X POST "https://${RPC_HOST}/api/account/work-servers/register-worker" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${api_key}" \
+    --data "{\"payoutAddress\":\"${payout}\",\"bidPerWork\":\"${bid}\",\"workerName\":\"${worker_name}\",\"labels\":\"${labels}\"}" || true
+}
+
+heartbeat_once() {
+  [[ -f "$CONFIG_FILE" ]] || return 1
+  api_key_present || return 2
+
+  local api_key worker_name labels tunnel_host tunnel_public_host tunnel_public_url remote_port local_port ssh_key_path ssh_public_key provider ngrok_credential_id
+  api_key="$(cfg_required '.apiKey')"
+  worker_name="$(cfg_get '.workerName' 2>/dev/null || printf "")"
+  labels="$(cfg_get '.labels' 2>/dev/null || printf "")"
+  tunnel_host="$(cfg_get '.tunnel.host' 2>/dev/null || printf "")"
+  tunnel_public_host="$(cfg_get '.tunnel.publicHost' 2>/dev/null || printf "")"
+  tunnel_public_url="$(cfg_get '.tunnel.publicUrl' 2>/dev/null || printf "")"
+  remote_port="$(cfg_get '.tunnel.remotePort' 2>/dev/null || printf "")"
+  local_port="$(cfg_get '.localPort' 2>/dev/null || printf "7077")"
+  ssh_key_path="$(cfg_get '.tunnel.sshKeyPath' 2>/dev/null || printf "")"
+  ngrok_credential_id="$(cfg_get '.tunnel.ngrokCredentialId' 2>/dev/null || printf "")"
+  provider="$(tunnel_provider)"
+
+  ssh_public_key=""
+  if [[ "$provider" == "reverse-ssh" && -n "$ssh_key_path" && -f "$ssh_key_path.pub" ]]; then
+    ssh_public_key="$(cat "$ssh_key_path.pub" 2>/dev/null || printf "")"
+  fi
+
+  if [[ -z "$tunnel_public_host" || "$tunnel_public_host" == "null" ]]; then
+    tunnel_public_host="$tunnel_host"
+  fi
+
+  if [[ "$provider" == "ngrok" ]]; then
+    local discovered_url host_part
+    discovered_url="$(discover_ngrok_public_url || printf '')"
+    if [[ -n "$discovered_url" ]]; then
+      tunnel_public_url="$discovered_url"
+      host_part="${discovered_url#*://}"
+      host_part="${host_part%%/*}"
+      host_part="${host_part%%:*}"
+      tunnel_public_host="$host_part"
+    fi
+  fi
+
+  local payload status_file body_file status
+  payload="{\"workerName\":\"${worker_name}\",\"labels\":\"${labels}\",\"localPort\":${local_port},\"tunnelHost\":\"${tunnel_public_host}\",\"tunnelPort\":\"${remote_port}\",\"tunnelUrl\":\"${tunnel_public_url}\",\"version\":\"${VERSION}\",\"sshPublicKey\":\"${ssh_public_key}\",\"ngrokCredentialId\":\"${ngrok_credential_id}\"}"
+  status_file="$RUN_DIR/heartbeat.http"
+  body_file="$RUN_DIR/heartbeat.body"
+
+  status="$(curl -sS -o "$body_file" -w "%{http_code}" \
+    -X POST "${RPC_API_BASE}/api/account/work-servers/heartbeat" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${api_key}" \
+    --data "$payload" || true)"
+
+  printf "%s" "$status" > "$status_file"
+  if [[ "$status" == "200" || "$status" == "204" ]]; then
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$RUN_DIR/heartbeat.last_success"
+    return 0
+  fi
+  return 1
+}
+
+heartbeat_loop_cmd() {
+  ensure_dirs
+  while true; do
+    if ! heartbeat_once; then
+      sleep 20
+    else
+      sleep 30
+    fi
+  done
+}
+
+start_heartbeat() {
+  api_key_present || return 0
+
+  if [[ -f "$RUN_DIR/heartbeat.pid" ]] && kill -0 "$(cat "$RUN_DIR/heartbeat.pid")" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  nohup "$0" __heartbeat-loop >>"$LOG_DIR/heartbeat.out.log" 2>>"$LOG_DIR/heartbeat.err.log" &
+  printf "%s" "$!" > "$RUN_DIR/heartbeat.pid"
+}
+
+stop_heartbeat() {
+  if [[ -f "$RUN_DIR/heartbeat.pid" ]]; then
+    local hp
+    hp="$(cat "$RUN_DIR/heartbeat.pid")"
+    if kill -0 "$hp" >/dev/null 2>&1; then
+      kill "$hp" >/dev/null 2>&1 || true
+      wait "$hp" >/dev/null 2>&1 || true
+    fi
+    rm -f "$RUN_DIR/heartbeat.pid"
+  fi
+}
+
+bootstrap_tunnel_bundle() {
+  local api_key="$1"
+  local worker_name="$2"
+  local local_port="$3"
+
+  curl -fsS \
+    -X POST "${RPC_API_BASE}/api/account/work-servers/bootstrap-tunnel" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${api_key}" \
+    --data "{\"workerName\":\"${worker_name}\",\"localPort\":${local_port},\"transport\":\"ngrok\",\"allowedActions\":[\"work_generate\"],\"allowedMethods\":[\"POST\"]}"
+}
+
+one_click_cmd() {
+  shift || true
+  detect_platform
+  ensure_dirs
+  install_deps
+  ensure_gpu_readiness
+  ensure_worker_binary
+
+  local api_key="${NANO_POW_API_KEY:-}"
+  local local_port="7077"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --api-key)
+        [[ -n "${2:-}" ]] || die "Missing value for --api-key"
+        api_key="$2"
+        shift 2
+        ;;
+      --local-port)
+        [[ -n "${2:-}" ]] || die "Missing value for --local-port"
+        local_port="$2"
+        shift 2
+        ;;
+      *)
+        die "Unknown flag: $1"
+        ;;
+    esac
+  done
+
+  if [[ -z "$api_key" ]]; then
+    read_secret_prompt api_key "Work API key: "
+    printf "\n"
+  fi
+  [[ -n "$api_key" ]] || die "API key is required"
+
+  local ssh_key worker_name bootstrap_worker_name
+  ssh_key=""
+  worker_name="$(hostname -s)"
+  bootstrap_worker_name="pow-$(random_short_id)"
+
+  log_info "Provisioning secure tunnel from backend"
+  local bundle
+  if ! bundle="$(bootstrap_tunnel_bundle "$api_key" "$bootstrap_worker_name" "$local_port")"; then
+    die "Tunnel bootstrap failed. Ensure RPC endpoint /api/account/work-servers/bootstrap-tunnel is available."
+  fi
+
+  local normalized_bundle
+  normalized_bundle="$(jq -c '
+    if (.response and .response.data) then .response.data
+    elif .data then .data
+    else .
+    end
+  ' <<<"$bundle" 2>/dev/null || printf '{}')"
+
+  local tunnel_host tunnel_user tunnel_port tunnel_enabled tunnel_bind_host worker_bin tunnel_public_host tunnel_public_url tunnel_provider_value ngrok_domain ngrok_authtoken ngrok_credential_id ngrok_allowed_cidrs
+  tunnel_host="$(jq -r '.tunnel.host // empty' <<<"$normalized_bundle")"
+  tunnel_user="$(jq -r '.tunnel.user // empty' <<<"$normalized_bundle")"
+  tunnel_port="$(jq -r '.tunnel.remotePort // empty' <<<"$normalized_bundle")"
+  tunnel_enabled="$(jq -r '.tunnel.enabled // true' <<<"$normalized_bundle")"
+  tunnel_bind_host="$(jq -r '.tunnel.bindHost // "127.0.0.1"' <<<"$normalized_bundle")"
+  tunnel_public_host="$(jq -r '.tunnel.publicHost // "tunnel.nano.to"' <<<"$normalized_bundle")"
+  tunnel_public_url="$(jq -r '.tunnel.publicUrl // empty' <<<"$normalized_bundle")"
+  tunnel_provider_value="$(jq -r '.tunnel.provider // "reverse-ssh"' <<<"$normalized_bundle")"
+  ngrok_domain="$(jq -r '.tunnel.ngrokDomain // empty' <<<"$normalized_bundle")"
+  ngrok_authtoken="$(jq -r '.tunnel.ngrokAuthtoken // empty' <<<"$normalized_bundle")"
+  ngrok_credential_id="$(jq -r '.tunnel.ngrokCredentialId // empty' <<<"$normalized_bundle")"
+  ngrok_allowed_cidrs="$(jq -r '(.policy.allowedSourceCidrs // .tunnel.allowedCidrs // []) | join(",")' <<<"$normalized_bundle")"
+  worker_bin="$(worker_binary_path)"
+
+  if [[ "$tunnel_provider_value" == "ngrok" ]]; then
+    install_ngrok_if_missing
+    tunnel_host=""
+    tunnel_user=""
+    tunnel_port="443"
+    tunnel_bind_host="127.0.0.1"
+    ssh_key=""
+    if [[ -z "$ngrok_authtoken" || "$ngrok_authtoken" == "null" ]]; then
+      ngrok_authtoken=""
+      log_warn "Bootstrap payload did not include ngrok authtoken; expecting ngrok account auth to already be configured on this machine."
+    fi
+  else
+    [[ -n "$tunnel_host" && -n "$tunnel_user" && -n "$tunnel_port" ]] || die "Invalid tunnel bootstrap payload"
+
+    ssh_key="$(ensure_dedicated_ssh_key)"
+    if jq -e '.tunnel.sshPrivateKey // empty' >/dev/null 2>&1 <<<"$normalized_bundle"; then
+      jq -r '.tunnel.sshPrivateKey' <<<"$normalized_bundle" > "$ssh_key"
+      chmod 600 "$ssh_key"
+    fi
+
+    local working_ssh_key
+    if working_ssh_key="$(select_working_ssh_key_for_tunnel "$tunnel_host" "$tunnel_user" "$ssh_key")"; then
+      if [[ "$working_ssh_key" != "$ssh_key" ]]; then
+        log_warn "Dedicated tunnel key not authorized yet; using existing SSH key: $working_ssh_key"
+      fi
+      ssh_key="$working_ssh_key"
+    else
+      log_warn "Could not verify tunnel SSH auth yet. Continuing with configured key; tunnel may not connect until key is authorized."
+    fi
+
+    if jq -e '.tunnel.knownHost // empty' >/dev/null 2>&1 <<<"$normalized_bundle"; then
+      local kh_file
+      kh_file="$CONFIG_DIR/known_hosts"
+      jq -r '.tunnel.knownHost' <<<"$normalized_bundle" > "$kh_file"
+      chmod 600 "$kh_file"
+    fi
+  fi
+
+  write_config "$api_key" "" "0" "$worker_name" "auto,managed" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_port" "$ssh_key" "$worker_bin" "$tunnel_enabled" "$tunnel_bind_host" "$tunnel_public_host" "$tunnel_provider_value" "$ngrok_authtoken" "$ngrok_domain" "$tunnel_public_url" "$ngrok_credential_id" "$ngrok_allowed_cidrs"
+
+  install_service
+  start_cmd
+
+  printf "\n%bNANO.TO POW SERVER%b ready\n" "$BOLD$GREEN" "$RESET"
+  printf "Run: %s status --watch\n" "$CLI_NAME"
+}
+
+worker_binary_path() {
+  if [[ -n "${NANO_POW_WORKER_BINARY:-}" && -x "${NANO_POW_WORKER_BINARY}" ]]; then
+    printf "%s" "${NANO_POW_WORKER_BINARY}"
+    return
+  fi
+
+  if [[ "$OS" == "mac" && "$ARCH" == "arm64" && -d "$PWD/lib/m3-nano-pow" ]]; then
+    printf "%s" "$PWD/lib/m3-nano-pow/.build/release/NanoPoW"
+    return
+  fi
+
+  if [[ -x "$PWD/build/nano_pow_server" ]]; then
+    printf "%s" "$PWD/build/nano_pow_server"
+    return
+  fi
+
+  if command -v nano_pow_server >/dev/null 2>&1; then
+    command -v nano_pow_server
+    return
+  fi
+
+  printf ""
+}
+
+ensure_worker_binary() {
+  local worker_bin
+  worker_bin="$(worker_binary_path)"
+  if [[ -n "$worker_bin" && -x "$worker_bin" ]]; then
+    log_ok "Worker binary ready: $worker_bin"
+    return
+  fi
+
+  if [[ "$OS" == "mac" && "$ARCH" == "arm64" && -d "$PWD/lib/m3-nano-pow" ]]; then
+    log_info "Building M3 worker runtime"
+    (cd "$PWD/lib/m3-nano-pow" && swift build -c release)
+    worker_bin="$(worker_binary_path)"
+    [[ -x "$worker_bin" ]] || die "Failed to build M3 worker"
+    log_ok "Built M3 worker: $worker_bin"
+    return
+  fi
+
+  die "No worker binary found. Build nano_pow_server first or run on M3 with lib/m3-nano-pow."
+}
+
+write_config() {
+  local api_key="$1"
+  local payout="$2"
+  local bid="$3"
+  local worker_name="$4"
+  local labels="$5"
+  local local_port="$6"
+  local tunnel_user="$7"
+  local tunnel_host="$8"
+  local tunnel_port="$9"
+  local ssh_key_path="${10}"
+  local worker_bin="${11}"
+  local tunnel_enabled_value="${12}"
+  local tunnel_bind_host="${13:-127.0.0.1}"
+  local tunnel_public_host="${14:-tunnel.nano.to}"
+  local tunnel_provider_value="${15:-reverse-ssh}"
+  local ngrok_authtoken="${16:-}"
+  local ngrok_domain="${17:-}"
+  local tunnel_public_url="${18:-}"
+  local ngrok_credential_id="${19:-}"
+  local ngrok_allowed_cidrs="${20:-}"
+
+  umask 077
+  cat > "$CONFIG_FILE" <<EOF
+{
+  "apiKey": "${api_key}",
+  "payoutAddress": "${payout}",
+  "bidPerWork": "${bid}",
+  "workerName": "${worker_name}",
+  "labels": "${labels}",
+  "localPort": ${local_port},
+  "tunnel": {
+    "enabled": ${tunnel_enabled_value},
+    "provider": "${tunnel_provider_value}",
+    "host": "${tunnel_host}",
+    "publicHost": "${tunnel_public_host}",
+    "publicUrl": "${tunnel_public_url}",
+    "user": "${tunnel_user}",
+    "bindHost": "${tunnel_bind_host}",
+    "remotePort": ${tunnel_port},
+    "sshKeyPath": "${ssh_key_path}",
+    "ngrokDomain": "${ngrok_domain}",
+    "ngrokAuthtoken": "${ngrok_authtoken}",
+    "ngrokCredentialId": "${ngrok_credential_id}",
+    "ngrokAllowedCidrs": "${ngrok_allowed_cidrs}"
+  },
+  "worker": {
+    "binary": "${worker_bin}",
+    "args": "--port ${local_port}"
+  },
+  "createdAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "version": "${VERSION}"
+}
+EOF
+  chmod 600 "$CONFIG_FILE"
+}
+
+write_ngrok_policy_file() {
+  local cidr_csv
+  cidr_csv="$(cfg_get '.tunnel.ngrokAllowedCidrs' 2>/dev/null || printf '')"
+  if [[ -z "$cidr_csv" || "$cidr_csv" == "null" ]]; then
+    rm -f "$NGROK_POLICY_FILE" 2>/dev/null || true
+    return 1
+  fi
+
+  local cidr_json
+  cidr_json="$(printf "%s" "$cidr_csv" | tr ',' '\n' | sed 's/^\s*//;s/\s*$//' | awk 'NF' | jq -R . | jq -s .)"
+  [[ -n "$cidr_json" && "$cidr_json" != "null" ]] || return 1
+
+  umask 077
+  cat > "$NGROK_POLICY_FILE" <<EOF
+{
+  "on_http_request": [
+    {
+      "actions": [
+        {
+          "type": "restrict-ips",
+          "config": {
+            "enforce": true,
+            "allow": ${cidr_json}
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+  chmod 600 "$NGROK_POLICY_FILE"
+}
+
+render_step() {
+  local title="$1"
+  printf "\n%b==>%b %s\n" "$BOLD$BLUE" "$RESET" "$title"
+}
+
+setup_cmd() {
+  detect_platform
+  ensure_dirs
+  install_deps
+  ensure_gpu_readiness
+  ensure_worker_binary
+
+  local worker_bin
+  worker_bin="$(worker_binary_path)"
+
+  render_step "Nano PoW setup"
+  printf "OS: %s (%s), GPU: %s\n" "$OS" "$ARCH" "$GPU_VENDOR"
+
+  local api_key payout bid worker_name labels local_port tunnel_host tunnel_public_host tunnel_user tunnel_remote_port ssh_key no_tunnel
+  local setup_tunnel_host_arg setup_tunnel_user_arg setup_tunnel_port_arg setup_ssh_key_arg
+
+  no_tunnel="false"
+  setup_tunnel_host_arg=""
+  setup_tunnel_user_arg=""
+  setup_tunnel_port_arg=""
+  setup_ssh_key_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local-only|--no-tunnel)
+        no_tunnel="true"
+        shift
+        ;;
+      --local-port)
+        [[ -n "${2:-}" ]] || die "Missing value for --local-port"
+        local_port="$2"
+        shift 2
+        ;;
+      --tunnel-host)
+        [[ -n "${2:-}" ]] || die "Missing value for --tunnel-host"
+        setup_tunnel_host_arg="$2"
+        shift 2
+        ;;
+      --tunnel-user)
+        [[ -n "${2:-}" ]] || die "Missing value for --tunnel-user"
+        setup_tunnel_user_arg="$2"
+        shift 2
+        ;;
+      --tunnel-port)
+        [[ -n "${2:-}" ]] || die "Missing value for --tunnel-port"
+        setup_tunnel_port_arg="$2"
+        shift 2
+        ;;
+      --ssh-key)
+        [[ -n "${2:-}" ]] || die "Missing value for --ssh-key"
+        setup_ssh_key_arg="$2"
+        shift 2
+        ;;
+      *)
+        die "Unknown setup flag: $1"
+        ;;
+    esac
+  done
+
+  local_port="${local_port:-7077}"
+
+  if [[ "$no_tunnel" == "true" ]]; then
+    api_key=""
+    log_warn "Local-only mode: skipping API key prompt"
+  else
+    api_key="${NANO_POW_API_KEY:-${WORK_API_KEY:-}}"
+    if [[ -n "$api_key" ]]; then
+      log_info "Using Work API key from environment"
+    else
+      read_prompt api_key "Work API key or @username: "
+    fi
+    [[ -n "$api_key" ]] || die "API key is required"
+  fi
+
+  read_prompt payout "Nano payout address or @name: "
+  validate_payout_address "$payout" || die "Invalid payout format. Use nano_... or @name"
+
+  read_prompt bid "Bid per work [0.00001]: "
+  bid="${bid:-0.00001}"
+
+  read_prompt worker_name "Worker name [$(hostname -s)]: "
+  worker_name="${worker_name:-$(hostname -s)}"
+
+  labels="m3,auto"
+
+  tunnel_host="${setup_tunnel_host_arg:-$RPC_HOST}"
+  tunnel_public_host="tunnel.nano.to"
+  tunnel_user="pow"
+  tunnel_remote_port="17077"
+  ssh_key="$(ensure_dedicated_ssh_key)"
+
+  if [[ -n "$setup_tunnel_user_arg" ]]; then
+    tunnel_user="$setup_tunnel_user_arg"
+  fi
+  if [[ -n "$setup_tunnel_port_arg" ]]; then
+    tunnel_remote_port="$setup_tunnel_port_arg"
+  fi
+  if [[ -n "$setup_ssh_key_arg" ]]; then
+    ssh_key="$setup_ssh_key_arg"
+  fi
+
+  if [[ "$no_tunnel" != "true" ]]; then
+    if [[ ! -f "$ssh_key" ]]; then
+      ensure_dedicated_ssh_key >/dev/null
+    fi
+    [[ -f "$ssh_key" ]] || die "SSH key not found: $ssh_key"
+  fi
+
+  if [[ "$no_tunnel" != "true" ]]; then
+    validate_api_key_remote "$api_key"
+    register_worker_remote "$api_key" "$payout" "$bid" "$worker_name" "$labels"
+  fi
+  write_config "$api_key" "$payout" "$bid" "$worker_name" "$labels" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_remote_port" "$ssh_key" "$worker_bin" "$([[ "$no_tunnel" == "true" ]] && printf "false" || printf "true")" "127.0.0.1" "$tunnel_public_host" "reverse-ssh" "" "" "" "" ""
+
+  install_service
+  start_cmd
+
+  log_ok "Setup complete"
+  if [[ "$no_tunnel" == "true" ]]; then
+    printf "API key: (not set, local-only mode)\n"
+  else
+    printf "API key: %s\n" "$(mask_key "$api_key")"
+  fi
+  printf "Config: %s\n" "$CONFIG_FILE"
+  if [[ "$no_tunnel" == "true" ]]; then
+    log_warn "Tunnel disabled (local-only mode)"
+  fi
+  printf "Run '%s status --watch' for live TUI\n" "$CLI_NAME"
+}
+
+mac_worker_plist_path() {
+  printf "%s/Library/LaunchAgents/%s.plist" "$HOME" "$MAC_WORKER_LABEL"
+}
+
+mac_tunnel_plist_path() {
+  printf "%s/Library/LaunchAgents/%s.plist" "$HOME" "$MAC_TUNNEL_LABEL"
+}
+
+write_mac_worker_plist() {
+  local worker_bin worker_args
+  worker_bin="$(cfg_required '.worker.binary')"
+  worker_args="$(cfg_required '.worker.args')"
+  local out_log err_log
+  out_log="$LOG_DIR/worker.out.log"
+  err_log="$LOG_DIR/worker.err.log"
+
+  cat > "$(mac_worker_plist_path)" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${MAC_WORKER_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${worker_bin}</string>
+      <string>--port</string>
+      <string>$(cfg_required '.localPort')</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${out_log}</string>
+    <key>StandardErrorPath</key>
+    <string>${err_log}</string>
+  </dict>
+</plist>
+EOF
+}
+
+write_mac_tunnel_plist() {
+  tunnel_enabled || return 0
+  local provider local_port
+  provider="$(tunnel_provider)"
+  local_port="$(cfg_required '.localPort')"
+
+  if [[ "$provider" == "ngrok" ]]; then
+    local ngrok_authtoken ngrok_domain ngrok_bin ngrok_token_arg ngrok_url_arg ngrok_policy_arg
+    ngrok_authtoken="$(cfg_get '.tunnel.ngrokAuthtoken' 2>/dev/null || printf '')"
+    ngrok_domain="$(cfg_get '.tunnel.ngrokDomain' 2>/dev/null || printf '')"
+    ngrok_bin="$(command -v ngrok 2>/dev/null || printf '')"
+    [[ -n "$ngrok_bin" ]] || die "ngrok not found. Install ngrok and re-run setup/one-click."
+    ngrok_policy_arg=""
+    if write_ngrok_policy_file; then
+      ngrok_policy_arg="<string>--traffic-policy-file=${NGROK_POLICY_FILE}</string>"
+    fi
+
+    ngrok_token_arg=""
+    if [[ -n "$ngrok_authtoken" && "$ngrok_authtoken" != "null" ]]; then
+      ngrok_token_arg="<string>--authtoken=${ngrok_authtoken}</string>"
+    fi
+
+    ngrok_url_arg=""
+    if [[ -n "$ngrok_domain" && "$ngrok_domain" != "null" ]]; then
+      ngrok_url_arg="<string>--url=${ngrok_domain}</string>"
+    fi
+
+    cat > "$(mac_tunnel_plist_path)" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${MAC_TUNNEL_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${ngrok_bin}</string>
+      <string>http</string>
+      ${ngrok_token_arg}
+      ${ngrok_url_arg}
+      ${ngrok_policy_arg}
+      <string>127.0.0.1:${local_port}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/tunnel.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/tunnel.err.log</string>
+  </dict>
+</plist>
+EOF
+    return 0
+  fi
+
+  local host user remote_port ssh_key bind_host autossh_bin
+  host="$(cfg_required '.tunnel.host')"
+  user="$(cfg_required '.tunnel.user')"
+  remote_port="$(cfg_required '.tunnel.remotePort')"
+  ssh_key="$(cfg_required '.tunnel.sshKeyPath')"
+  bind_host="$(cfg_get '.tunnel.bindHost' 2>/dev/null || printf '127.0.0.1')"
+  autossh_bin="$(find_autossh_binary 2>/dev/null || printf '')"
+  [[ -n "$autossh_bin" ]] || die "autossh not found. Install it (brew install autossh) and re-run setup/one-click."
+
+  cat > "$(mac_tunnel_plist_path)" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${MAC_TUNNEL_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${autossh_bin}</string>
+      <string>-M</string><string>0</string>
+      <string>-N</string>
+      <string>-o</string><string>ServerAliveInterval=30</string>
+      <string>-o</string><string>ServerAliveCountMax=3</string>
+      <string>-o</string><string>ExitOnForwardFailure=yes</string>
+      <string>-o</string><string>StrictHostKeyChecking=accept-new</string>
+      <string>-o</string><string>IdentitiesOnly=yes</string>
+      <string>-i</string><string>${ssh_key}</string>
+      <string>-R</string><string>${bind_host}:${remote_port}:127.0.0.1:${local_port}</string>
+      <string>${user}@${host}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/tunnel.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/tunnel.err.log</string>
+  </dict>
+</plist>
+EOF
+}
+
+find_autossh_binary() {
+  local detected
+  detected="$(command -v autossh 2>/dev/null || printf "")"
+  if [[ -n "$detected" && -x "$detected" ]]; then
+    printf "%s" "$detected"
+    return 0
+  fi
+
+  local candidates=(
+    "/opt/homebrew/bin/autossh"
+    "/usr/local/bin/autossh"
+    "/opt/local/bin/autossh"
+    "/usr/bin/autossh"
+  )
+
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+      printf "%s" "$c"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+write_linux_units() {
+  local systemd_dir
+  systemd_dir="${HOME}/.config/systemd/user"
+  mkdir -p "$systemd_dir"
+
+  local worker_bin local_port host user remote_port ssh_key bind_host provider
+  worker_bin="$(cfg_required '.worker.binary')"
+  local_port="$(cfg_required '.localPort')"
+  provider="$(tunnel_provider)"
+
+  cat > "$systemd_dir/$LINUX_WORKER_UNIT" <<EOF
+[Unit]
+Description=Nano PoW Worker
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${worker_bin} --config server.log_to_stderr=true
+Restart=always
+RestartSec=2
+StandardOutput=append:${LOG_DIR}/worker.out.log
+StandardError=append:${LOG_DIR}/worker.err.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+  if tunnel_enabled; then
+  if [[ "$provider" == "ngrok" ]]; then
+    local ngrok_authtoken ngrok_domain ngrok_token_arg ngrok_url_arg ngrok_policy_arg
+    ngrok_authtoken="$(cfg_get '.tunnel.ngrokAuthtoken' 2>/dev/null || printf '')"
+    ngrok_domain="$(cfg_get '.tunnel.ngrokDomain' 2>/dev/null || printf '')"
+    ngrok_policy_arg=""
+    if write_ngrok_policy_file; then
+      ngrok_policy_arg=" --traffic-policy-file=${NGROK_POLICY_FILE}"
+    fi
+    ngrok_token_arg=""
+    if [[ -n "$ngrok_authtoken" && "$ngrok_authtoken" != "null" ]]; then
+      ngrok_token_arg=" --authtoken=${ngrok_authtoken}"
+    fi
+    ngrok_url_arg=""
+    if [[ -n "$ngrok_domain" && "$ngrok_domain" != "null" ]]; then
+      ngrok_url_arg=" --url=${ngrok_domain}"
+    fi
+
+  cat > "$systemd_dir/$LINUX_TUNNEL_UNIT" <<EOF
+[Unit]
+Description=Nano PoW ngrok Tunnel
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env ngrok http${ngrok_token_arg}${ngrok_url_arg}${ngrok_policy_arg} 127.0.0.1:${local_port}
+Restart=always
+RestartSec=2
+StandardOutput=append:${LOG_DIR}/tunnel.out.log
+StandardError=append:${LOG_DIR}/tunnel.err.log
+
+[Install]
+WantedBy=default.target
+EOF
+  else
+    host="$(cfg_required '.tunnel.host')"
+    user="$(cfg_required '.tunnel.user')"
+    remote_port="$(cfg_required '.tunnel.remotePort')"
+    ssh_key="$(cfg_required '.tunnel.sshKeyPath')"
+    bind_host="$(cfg_get '.tunnel.bindHost' 2>/dev/null || printf '127.0.0.1')"
+
+  cat > "$systemd_dir/$LINUX_TUNNEL_UNIT" <<EOF
+[Unit]
+Description=Nano PoW Reverse Tunnel
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env autossh -M 0 -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i ${ssh_key} -R ${bind_host}:${remote_port}:127.0.0.1:${local_port} ${user}@${host}
+Restart=always
+RestartSec=2
+StandardOutput=append:${LOG_DIR}/tunnel.out.log
+StandardError=append:${LOG_DIR}/tunnel.err.log
+
+[Install]
+WantedBy=default.target
+EOF
+  fi
+  else
+    rm -f "$systemd_dir/$LINUX_TUNNEL_UNIT"
+  fi
+}
+
+install_service() {
+  detect_platform
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found. Run '$CLI_NAME setup' first."
+
+  case "$OS" in
+    mac)
+      mkdir -p "$HOME/Library/LaunchAgents"
+      write_mac_worker_plist
+      write_mac_tunnel_plist
+      launchctl bootout "gui/$(id -u)/$MAC_WORKER_LABEL" >/dev/null 2>&1 || true
+      launchctl bootout "gui/$(id -u)/$MAC_TUNNEL_LABEL" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$(id -u)" "$(mac_worker_plist_path)"
+      if tunnel_enabled; then
+        launchctl bootstrap "gui/$(id -u)" "$(mac_tunnel_plist_path)"
+      else
+        rm -f "$(mac_tunnel_plist_path)"
+      fi
+      ;;
+    linux)
+      write_linux_units
+      systemctl --user daemon-reload
+      systemctl --user enable "$LINUX_WORKER_UNIT" >/dev/null
+      if tunnel_enabled; then
+        systemctl --user enable "$LINUX_TUNNEL_UNIT" >/dev/null
+      else
+        systemctl --user disable "$LINUX_TUNNEL_UNIT" >/dev/null 2>&1 || true
+      fi
+      ;;
+    windows)
+      log_warn "Service install for Windows is not implemented yet. Falling back to foreground commands."
+      ;;
+    *)
+      die "Unsupported OS for service installation: $OS"
+      ;;
+  esac
+}
+
+worker_running() {
+  case "$OS" in
+    mac)
+      launchctl print "gui/$(id -u)/$MAC_WORKER_LABEL" 2>/dev/null | grep -q "state = running"
+      ;;
+    linux)
+      systemctl --user is-active --quiet "$LINUX_WORKER_UNIT"
+      ;;
+    windows)
+      [[ -f "$RUN_DIR/worker.pid" ]] && kill -0 "$(cat "$RUN_DIR/worker.pid")" >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+tunnel_running() {
+  tunnel_enabled || return 1
+  case "$OS" in
+    mac)
+      launchctl print "gui/$(id -u)/$MAC_TUNNEL_LABEL" 2>/dev/null | grep -q "state = running"
+      ;;
+    linux)
+      systemctl --user is-active --quiet "$LINUX_TUNNEL_UNIT"
+      ;;
+    windows)
+      [[ -f "$RUN_DIR/tunnel.pid" ]] && kill -0 "$(cat "$RUN_DIR/tunnel.pid")" >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+api_health() {
+  local port
+  local body
+  port="$(cfg_get '.localPort' 2>/dev/null || printf "7077")"
+
+  body="$(curl -sS --max-time 5 -X POST "http://127.0.0.1:${port}" -H "Content-Type: application/json" --data '{"action":"work_generate","hash":"E89208DD038FBB269987689621D52292FE9B863A173550C797762D7329D0E0F7"}' 2>/dev/null || printf '')"
+  if [[ -z "$body" ]]; then
+    curl -sS --max-time 3 "http://127.0.0.1:${port}/api/v1/ping" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+
+  # Some workers return a full RPC-style payload without work on this synthetic probe.
+  if command -v jq >/dev/null 2>&1; then
+    if jq -e '.error == null and (.work == null or ((.work|type=="string") and (.work|length==16)))' >/dev/null 2>&1 <<<"$body"; then
+      return 0
+    fi
+  else
+    if ! grep -q '"error"' <<<"$body"; then
+      return 0
+    fi
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -e '.work and (.work|type=="string") and (.work|length==16)' >/dev/null 2>&1 <<<"$body"
+  else
+    grep -q '"work"' <<<"$body"
+  fi
+}
+
+heartbeat_recent_success() {
+  local max_age="${1:-300}"
+  local now ts age
+  [[ -f "$RUN_DIR/heartbeat.last_success" ]] || return 1
+  now="$(date +%s)"
+  ts="$(cat "$RUN_DIR/heartbeat.last_success" 2>/dev/null || printf "0")"
+  if [[ "$ts" =~ ^[0-9]+$ ]]; then
+    :
+  else
+    ts="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || printf "0")"
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+  fi
+  age=$(( now - ts ))
+  [[ "$age" -ge 0 && "$age" -le "$max_age" ]]
+}
+
+status_line() {
+  local ok_text="${GREEN}healthy${RESET}"
+  local bad_text="${RED}down${RESET}"
+  local worker_status tunnel_status api_status hb_status
+  local worker_ok="false"
+  local hb_ok="false"
+  if worker_running; then worker_status="$ok_text"; else worker_status="$bad_text"; fi
+  if worker_running; then worker_ok="true"; fi
+  if tunnel_enabled; then
+    if tunnel_running; then tunnel_status="$ok_text"; else tunnel_status="$bad_text"; fi
+  else
+    tunnel_status="${YELLOW}disabled${RESET}"
+  fi
+  if heartbeat_recent_success 300; then hb_ok="true"; fi
+  if api_health || [[ "$hb_ok" == "true" ]] || ([[ "$worker_ok" == "true" ]] && [[ "$hb_ok" == "true" ]]); then api_status="$ok_text"; else api_status="$bad_text"; fi
+  if api_key_present; then
+    if [[ "$hb_ok" == "true" ]]; then
+      hb_status="$ok_text"
+    else
+      hb_status="${YELLOW}pending${RESET}"
+    fi
+  else
+    hb_status="${YELLOW}disabled(no-key)${RESET}"
+  fi
+
+  printf "%-16s %b\n" "Worker" "$worker_status"
+  printf "%-16s %b\n" "Tunnel" "$tunnel_status"
+  printf "%-16s %b\n" "Local API" "$api_status"
+  printf "%-16s %b\n" "Heartbeat" "$hb_status"
+}
+
+status_cmd() {
+  detect_platform
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found. Run '$CLI_NAME setup'."
+
+  local watch="false"
+  if [[ "${1:-}" == "--watch" ]]; then
+    watch="true"
+  fi
+
+  while true; do
+    if [[ "$watch" == "true" ]]; then
+      printf "\033[2J\033[H"
+    fi
+
+    printf "%b%s%b v%s\n" "$BOLD" "$CLI_NAME" "$RESET" "$VERSION"
+    printf "%-16s %s\n" "OS" "${OS}/${ARCH}"
+    printf "%-16s %s\n" "GPU" "$GPU_VENDOR"
+    if tunnel_enabled; then
+      local provider
+      provider="$(tunnel_provider)"
+      printf "%-16s %s\n" "Tunnel mode" "$provider"
+      if [[ "$provider" == "ngrok" ]]; then
+        printf "%-16s %s\n" "Public URL" "$(cfg_get '.tunnel.publicUrl' 2>/dev/null || printf 'https://unknown.ngrok.app')"
+      else
+        printf "%-16s %s\n" "RPC host" "$(cfg_required '.tunnel.host')"
+        printf "%-16s %s\n" "Bind host" "$(cfg_get '.tunnel.bindHost' 2>/dev/null || printf '127.0.0.1')"
+        printf "%-16s %s\n" "Remote port" "$(cfg_required '.tunnel.remotePort')"
+      fi
+    else
+      printf "%-16s %s\n" "RPC host" "(local-only)"
+      printf "%-16s %s\n" "Remote port" "(disabled)"
+    fi
+    printf "%-16s %s\n" "Local port" "$(cfg_required '.localPort')"
+    printf "%-16s %s\n" "Worker" "$(cfg_required '.worker.binary')"
+    printf "\n"
+    status_line
+
+    if [[ "$watch" != "true" ]]; then
+      break
+    fi
+    sleep 1
+  done
+}
+
+start_cmd() {
+  detect_platform
+  case "$OS" in
+    mac)
+      launchctl bootstrap "gui/$(id -u)" "$(mac_worker_plist_path)" >/dev/null 2>&1 || true
+      launchctl kickstart -k "gui/$(id -u)/$MAC_WORKER_LABEL"
+      if tunnel_enabled; then
+        launchctl bootstrap "gui/$(id -u)" "$(mac_tunnel_plist_path)" >/dev/null 2>&1 || true
+        launchctl kickstart -k "gui/$(id -u)/$MAC_TUNNEL_LABEL"
+      fi
+      ;;
+    linux)
+      systemctl --user start "$LINUX_WORKER_UNIT"
+      if tunnel_enabled; then
+        systemctl --user start "$LINUX_TUNNEL_UNIT"
+      fi
+      ;;
+    windows)
+      local worker_bin host user remote_port local_port ssh_key bind_host provider ngrok_authtoken ngrok_domain ngrok_policy_file_arg
+      worker_bin="$(cfg_required '.worker.binary')"
+      local_port="$(cfg_required '.localPort')"
+      nohup "$worker_bin" --port "$local_port" >>"$LOG_DIR/worker.out.log" 2>>"$LOG_DIR/worker.err.log" &
+      printf "%s" "$!" > "$RUN_DIR/worker.pid"
+      if tunnel_enabled; then
+        provider="$(tunnel_provider)"
+        if [[ "$provider" == "ngrok" ]]; then
+          ngrok_authtoken="$(cfg_get '.tunnel.ngrokAuthtoken' 2>/dev/null || printf '')"
+          ngrok_domain="$(cfg_get '.tunnel.ngrokDomain' 2>/dev/null || printf '')"
+          ngrok_policy_file_arg=""
+          if write_ngrok_policy_file; then
+            ngrok_policy_file_arg="--traffic-policy-file $NGROK_POLICY_FILE"
+          fi
+          if [[ -n "$ngrok_authtoken" && "$ngrok_authtoken" != "null" ]]; then
+            if [[ -n "$ngrok_domain" && "$ngrok_domain" != "null" ]]; then
+              if [[ -n "$ngrok_policy_file_arg" ]]; then
+                nohup ngrok http --authtoken "$ngrok_authtoken" --url "$ngrok_domain" --traffic-policy-file "$NGROK_POLICY_FILE" "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              else
+                nohup ngrok http --authtoken "$ngrok_authtoken" --url "$ngrok_domain" "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              fi
+            else
+              if [[ -n "$ngrok_policy_file_arg" ]]; then
+                nohup ngrok http --authtoken "$ngrok_authtoken" --traffic-policy-file "$NGROK_POLICY_FILE" "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              else
+                nohup ngrok http --authtoken "$ngrok_authtoken" "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              fi
+            fi
+          else
+            if [[ -n "$ngrok_domain" && "$ngrok_domain" != "null" ]]; then
+              if [[ -n "$ngrok_policy_file_arg" ]]; then
+                nohup ngrok http --url "$ngrok_domain" --traffic-policy-file "$NGROK_POLICY_FILE" "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              else
+                nohup ngrok http --url "$ngrok_domain" "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              fi
+            else
+              if [[ -n "$ngrok_policy_file_arg" ]]; then
+                nohup ngrok http --traffic-policy-file "$NGROK_POLICY_FILE" "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              else
+                nohup ngrok http "127.0.0.1:$local_port" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+              fi
+            fi
+          fi
+        else
+          host="$(cfg_required '.tunnel.host')"
+          user="$(cfg_required '.tunnel.user')"
+          remote_port="$(cfg_required '.tunnel.remotePort')"
+          ssh_key="$(cfg_required '.tunnel.sshKeyPath')"
+          bind_host="$(cfg_get '.tunnel.bindHost' 2>/dev/null || printf '127.0.0.1')"
+          nohup autossh -M 0 -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i "$ssh_key" -R "$bind_host:$remote_port:127.0.0.1:$local_port" "$user@$host" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
+        fi
+        printf "%s" "$!" > "$RUN_DIR/tunnel.pid"
+      fi
+      ;;
+  esac
+  start_heartbeat
+  if tunnel_enabled; then
+    log_ok "Started worker + tunnel"
+  else
+    log_ok "Started worker (local-only mode)"
+  fi
+}
+
+stop_cmd() {
+  detect_platform
+  case "$OS" in
+    mac)
+      launchctl bootout "gui/$(id -u)/$MAC_WORKER_LABEL" >/dev/null 2>&1 || true
+      if tunnel_enabled; then
+        launchctl bootout "gui/$(id -u)/$MAC_TUNNEL_LABEL" >/dev/null 2>&1 || true
+      fi
+      ;;
+    linux)
+      systemctl --user stop "$LINUX_WORKER_UNIT" >/dev/null 2>&1 || true
+      if tunnel_enabled; then
+        systemctl --user stop "$LINUX_TUNNEL_UNIT" >/dev/null 2>&1 || true
+      fi
+      ;;
+    windows)
+      if [[ -f "$RUN_DIR/worker.pid" ]]; then kill "$(cat "$RUN_DIR/worker.pid")" >/dev/null 2>&1 || true; rm -f "$RUN_DIR/worker.pid"; fi
+      if tunnel_enabled && [[ -f "$RUN_DIR/tunnel.pid" ]]; then kill "$(cat "$RUN_DIR/tunnel.pid")" >/dev/null 2>&1 || true; rm -f "$RUN_DIR/tunnel.pid"; fi
+      ;;
+  esac
+  stop_heartbeat
+  if tunnel_enabled; then
+    log_ok "Stopped worker + tunnel"
+  else
+    log_ok "Stopped worker"
+  fi
+}
+
+restart_cmd() {
+  stop_cmd
+  sleep 1
+  start_cmd
+}
+
+tunnel_cmd() {
+  detect_platform
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found. Run '$CLI_NAME setup' first."
+  api_key_present || die "API key missing in config. Run '$CLI_NAME setup' first."
+  tunnel_enabled || die "Tunnel is disabled in config. Re-run '$CLI_NAME setup' without --local-only."
+
+  start_cmd
+
+  if heartbeat_once; then
+    log_ok "Tunnel mode active; heartbeat sent"
+  else
+    local code
+    code="$(cat "$RUN_DIR/heartbeat.http" 2>/dev/null || printf "unknown")"
+    log_warn "Tunnel mode active; heartbeat pending (HTTP ${code})"
+  fi
+}
+
+logs_cmd() {
+  local tail_n="100"
+  if [[ "${1:-}" == "--tail" && -n "${2:-}" ]]; then
+    tail_n="$2"
+  fi
+
+  printf "== worker.err.log ==\n"
+  if [[ -f "$LOG_DIR/worker.err.log" ]]; then
+    tail -n "$tail_n" "$LOG_DIR/worker.err.log"
+  else
+    printf "(no log yet)\n"
+  fi
+
+  printf "\n== tunnel.err.log ==\n"
+  if ! tunnel_enabled; then
+    printf "(tunnel disabled in local-only mode)\n"
+  elif [[ -f "$LOG_DIR/tunnel.err.log" ]]; then
+    tail -n "$tail_n" "$LOG_DIR/tunnel.err.log"
+  else
+    printf "(no log yet)\n"
+  fi
+}
+
+doctor_cmd() {
+  detect_platform
+  detect_gpu_vendor
+  printf "%bNano PoW Doctor%b\n\n" "$BOLD" "$RESET"
+  printf "%-20s %s\n" "OS" "$OS"
+  printf "%-20s %s\n" "Arch" "$ARCH"
+  printf "%-20s %s\n" "GPU" "$GPU_VENDOR"
+  printf "%-20s %s\n" "Config" "$CONFIG_FILE"
+  printf "\nDependencies:\n"
+  for dep in curl jq ssh autossh ngrok; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      printf "  - %-12s %bOK%b\n" "$dep" "$GREEN" "$RESET"
+    else
+      printf "  - %-12s %bMISSING%b\n" "$dep" "$RED" "$RESET"
+    fi
+  done
+  printf "\nServices:\n"
+  if worker_running; then printf "  - worker: %bup%b\n" "$GREEN" "$RESET"; else printf "  - worker: %bdown%b\n" "$RED" "$RESET"; fi
+  if tunnel_enabled; then
+    if tunnel_running; then printf "  - tunnel: %bup%b\n" "$GREEN" "$RESET"; else printf "  - tunnel: %bdown%b\n" "$RED" "$RESET"; fi
+  else
+    printf "  - tunnel: %bdisabled%b\n" "$YELLOW" "$RESET"
+  fi
+
+  if [[ "$OS" == "linux" ]]; then
+    ensure_gpu_readiness
+  fi
+}
+
+uninstall_cmd() {
+  stop_cmd || true
+  detect_platform
+  case "$OS" in
+    mac)
+      rm -f "$(mac_worker_plist_path)" "$(mac_tunnel_plist_path)"
+      ;;
+    linux)
+      rm -f "${HOME}/.config/systemd/user/$LINUX_WORKER_UNIT" "${HOME}/.config/systemd/user/$LINUX_TUNNEL_UNIT"
+      systemctl --user daemon-reload || true
+      ;;
+  esac
+
+  rm -rf "$CONFIG_DIR" "$STATE_DIR"
+  log_ok "Uninstalled nano-pow user setup"
+}
+
+install_cli_cmd() {
+  local target="/usr/local/bin/nano-pow"
+  run_with_sudo install -m 0755 "$0" "$target"
+  log_ok "Installed CLI to $target"
+}
+
+usage() {
+  cat <<EOF
+${CLI_NAME} v${VERSION}
+
+Usage:
+  ${CLI_NAME} one-click [--api-key KEY] [--local-port N]
+  ${CLI_NAME} --tunnel
+  ${CLI_NAME} --local [--port N] [--debug]
+  ${CLI_NAME} setup [--local-only|--no-tunnel] [--local-port N]
+                   [--tunnel-host HOST --tunnel-user USER --tunnel-port PORT --ssh-key PATH]
+  ${CLI_NAME} start | stop | restart
+  ${CLI_NAME} status [--watch]
+  ${CLI_NAME} logs [--tail N]
+  ${CLI_NAME} doctor
+  ${CLI_NAME} uninstall
+  ${CLI_NAME} install-cli
+EOF
+}
+
+local_run_cmd() {
+  shift || true
+  local port="7077"
+  DEBUG_MODE="0"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        [[ -n "${2:-}" ]] || die "Missing value for --port"
+        port="$2"
+        shift 2
+        ;;
+      --debug)
+        DEBUG_MODE="1"
+        shift
+        ;;
+      *)
+        die "Unknown local flag: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$DEBUG_MODE" != "1" ]]; then
+    QUIET_MODE="1"
+  fi
+
+  detect_platform
+  install_local_deps
+  ensure_gpu_readiness
+  ensure_worker_binary
+
+  local worker_bin
+  worker_bin="$(worker_binary_path)"
+  [[ -x "$worker_bin" ]] || die "Worker binary not found"
+
+  local out_log err_log
+  out_log="$LOG_DIR/local-worker.out.log"
+  err_log="$LOG_DIR/local-worker.err.log"
+
+  if [[ "$(basename "$worker_bin")" == "NanoPoW" ]]; then
+    if [[ "$DEBUG_MODE" == "1" ]]; then
+      : > "$out_log"
+      : > "$err_log"
+      "$worker_bin" --port "$port" >>"$out_log" 2>>"$err_log" &
+    else
+      "$worker_bin" --port "$port" >/dev/null 2>/dev/null &
+    fi
+  else
+    if [[ "$DEBUG_MODE" == "1" ]]; then
+      : > "$out_log"
+      : > "$err_log"
+      "$worker_bin" --config server.log_to_stderr=true >>"$out_log" 2>>"$err_log" &
+    else
+      "$worker_bin" --config server.log_to_stderr=true >/dev/null 2>/dev/null &
+    fi
+  fi
+
+  LOCAL_WORKER_PID="$!"
+
+  sleep 1
+  if ! kill -0 "$LOCAL_WORKER_PID" >/dev/null 2>&1; then
+    log_err "Local worker failed to start"
+    if [[ "$DEBUG_MODE" == "1" && -s "$err_log" ]]; then
+      tail -n 30 "$err_log"
+    fi
+    return 1
+  fi
+
+  local_tui_loop "$LOCAL_WORKER_PID" "$port" "$worker_bin" "$out_log" "$err_log"
+}
+
+local_worker_http_health() {
+  local port="$1"
+  local code
+  code="$(curl -s --max-time 1 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${port}" 2>/dev/null || true)"
+  [[ "$code" != "000" ]]
+}
+
+format_duration() {
+  local seconds="$1"
+  local h m s
+  h=$((seconds / 3600))
+  m=$(((seconds % 3600) / 60))
+  s=$((seconds % 60))
+  printf "%02d:%02d:%02d" "$h" "$m" "$s"
+}
+
+cleanup_local_worker() {
+  if [[ -n "$LOCAL_WORKER_PID" ]] && kill -0 "$LOCAL_WORKER_PID" >/dev/null 2>&1; then
+    kill "$LOCAL_WORKER_PID" >/dev/null 2>&1 || true
+    wait "$LOCAL_WORKER_PID" >/dev/null 2>&1 || true
+  fi
+}
+
+local_tui_loop() {
+  local pid="$1"
+  local port="$2"
+  local worker_bin="$3"
+  local out_log="$4"
+  local err_log="$5"
+  local started_at now uptime key worker_state api_state
+  local spinner_index spinner_char pulse_index pulse_bar
+  local term_cols inner_width border_line
+  local probe_state probe_pid probe_result_file probe_code_file probe_output probe_code
+  local -a spinner_frames pulse_frames
+  spinner_frames=("|" "/" "-" "~")
+  pulse_frames=("[    ]" "[#   ]" "[##  ]" "[### ]" "[####]" "[ ###]" "[  ##]" "[   #]")
+  started_at="$(date +%s)"
+  LOCAL_TUI_STOP="0"
+  spinner_index=0
+  pulse_index=0
+  probe_state="idle"
+  probe_pid=""
+  probe_result_file="$RUN_DIR/local-probe.result"
+  probe_code_file="$RUN_DIR/local-probe.code"
+  rm -f "$probe_result_file" "$probe_code_file"
+
+  trap 'LOCAL_TUI_STOP="1"; cleanup_local_worker; printf "\033[?25h\033[?1049l\033[0m\n"' EXIT INT TERM
+  printf "\033[?1049h\033[?25l\033[2J\033[H"
+
+  while true; do
+    now="$(date +%s)"
+    uptime="$(format_duration $((now - started_at)))"
+
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      worker_state="ONLINE"
+    else
+      worker_state="OFFLINE"
+    fi
+
+    if local_worker_http_health "$port"; then
+      api_state="READY"
+    else
+      api_state="WARMING"
+    fi
+
+    spinner_char="${spinner_frames[$spinner_index]}"
+    pulse_bar="${pulse_frames[$pulse_index]}"
+    spinner_index=$(((spinner_index + 1) % ${#spinner_frames[@]}))
+    pulse_index=$(((pulse_index + 1) % ${#pulse_frames[@]}))
+
+    term_cols="$(tput cols 2>/dev/null || printf "100")"
+    inner_width=$((term_cols - 2))
+    if (( inner_width > 75 )); then inner_width=75; fi
+    if (( inner_width < 50 )); then inner_width=50; fi
+    border_line="$(printf '%*s' "$inner_width" '')"
+    border_line="${border_line// /=}"
+
+    if [[ -n "$probe_pid" ]] && ! kill -0 "$probe_pid" >/dev/null 2>&1; then
+      wait "$probe_pid" >/dev/null 2>&1 || true
+      probe_code="$(cat "$probe_code_file" 2>/dev/null || printf "1")"
+      probe_output="$(cat "$probe_result_file" 2>/dev/null || printf "")"
+      if [[ "$probe_code" == "0" ]]; then
+        probe_state="ok ${probe_output:0:48}"
+      else
+        probe_state="fail ${probe_output:0:48}"
+      fi
+      probe_pid=""
+    fi
+
+    printf "\033[H"
+    printf "%b+%s+%b\n" "$MAGENTA" "$border_line" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " NANO.TO POW SERVER   spinner=${spinner_char}" "$MAGENTA" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " LOCAL GRID  node=127.0.0.1  port=${port}  pulse=${pulse_bar}" "$MAGENTA" "$RESET"
+    printf "%b+%s+%b\n" "$MAGENTA" "$border_line" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " worker.binary  $(basename "$worker_bin")" "$MAGENTA" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " worker.pid     ${pid}" "$MAGENTA" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " worker.uptime  ${uptime}" "$MAGENTA" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " worker.state   ${worker_state}" "$MAGENTA" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " api.state      ${api_state}" "$MAGENTA" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " probe.state    ${probe_state}" "$MAGENTA" "$RESET"
+    printf "%b|%b%-*s%b|%b\n" "$MAGENTA" "$RESET" "$inner_width" " controls       [q] quit  [t] PoW probe  [--debug] show logs" "$MAGENTA" "$RESET"
+    printf "%b+%s+%b\n" "$MAGENTA" "$border_line" "$RESET"
+    if [[ "$DEBUG_MODE" == "1" ]]; then
+      printf "%b[ERR STREAM]%b\n" "$YELLOW" "$RESET"
+      if [[ -f "$err_log" ]]; then
+        tail -n 6 "$err_log"
+      else
+        printf "(no error logs)\n"
+      fi
+      printf "\n%b[OUT STREAM]%b\n" "$CYAN" "$RESET"
+      if [[ -f "$out_log" ]]; then
+        tail -n 6 "$out_log"
+      else
+        printf "(no output logs)\n"
+      fi
+      printf "\n"
+    fi
+
+    printf "%bTEST CURL%b\n" "$CYAN" "$RESET"
+    printf "curl -sS -X POST \"http://127.0.0.1:%s\" -H \"Content-Type: application/json\" --data '{\"action\":\"work_generate\",\"hash\":\"E89208DD038FBB269987689621D52292FE9B863A173550C797762D7329D0E0F7\"}'\n" "$port"
+
+    if [[ "$DEBUG_MODE" != "1" ]]; then
+      printf "\n%bTip:%b add --debug to view worker logs in TUI.\n" "$YELLOW" "$RESET"
+    fi
+
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      if [[ "$LOCAL_TUI_STOP" == "1" ]]; then
+        break
+      fi
+      printf "\n%bWorker process exited. Press any key to close.%b\n" "$RED" "$RESET"
+      read -r -s -n 1 || true
+      break
+    fi
+
+    key=""
+    read -r -s -n 1 -t 1 key || true
+    case "$key" in
+      q|Q)
+        LOCAL_TUI_STOP="1"
+        break
+        ;;
+      t|T)
+        if [[ -n "$probe_pid" ]] && kill -0 "$probe_pid" >/dev/null 2>&1; then
+          probe_state="running (already in progress)"
+        else
+          probe_state="running"
+          (
+            curl -sS --max-time 30 -X POST "http://127.0.0.1:${port}" -H "Content-Type: application/json" --data '{"action":"work_generate","hash":"E89208DD038FBB269987689621D52292FE9B863A173550C797762D7329D0E0F7"}' >"$probe_result_file" 2>&1
+            printf "%s" "$?" > "$probe_code_file"
+          ) &
+          probe_pid="$!"
+        fi
+        ;;
+    esac
+  done
+
+  if [[ -n "$probe_pid" ]] && kill -0 "$probe_pid" >/dev/null 2>&1; then
+    kill "$probe_pid" >/dev/null 2>&1 || true
+    wait "$probe_pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$probe_result_file" "$probe_code_file"
+
+  cleanup_local_worker
+  LOCAL_TUI_STOP="0"
+  trap - EXIT INT TERM
+  printf "\033[?25h\033[?1049l\033[0m\n"
+}
+
+main() {
+  ensure_dirs
+  detect_platform
+  detect_gpu_vendor
+
+  local cmd="${1:-}"
+  case "$cmd" in
+    __heartbeat-loop)
+      shift
+      heartbeat_loop_cmd "$@"
+      ;;
+    one-click)
+      one_click_cmd "$@"
+      ;;
+    --tunnel)
+      shift
+      tunnel_cmd "$@"
+      ;;
+    --local)
+      local_run_cmd "$@"
+      ;;
+    setup) shift; setup_cmd "$@" ;;
+    start) shift; start_cmd "$@" ;;
+    stop) shift; stop_cmd "$@" ;;
+    restart) shift; restart_cmd "$@" ;;
+    status) shift; status_cmd "$@" ;;
+    logs) shift; logs_cmd "$@" ;;
+    doctor) shift; doctor_cmd "$@" ;;
+    uninstall) shift; uninstall_cmd "$@" ;;
+    install-cli) shift; install_cli_cmd "$@" ;;
+    "")
+      one_click_cmd "$@"
+      ;;
+    -h|--help|help) usage ;;
+    *) die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

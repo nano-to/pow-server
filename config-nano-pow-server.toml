@@ -1,0 +1,6 @@
+[server]
+log_to_stderr = true
+
+[device]
+type = "cpu"
+threads = 8
