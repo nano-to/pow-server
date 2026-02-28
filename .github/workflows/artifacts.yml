@@ -13,7 +13,7 @@ jobs:
   osx_job:
     runs-on: macOS-latest
     steps:
-      - uses: actions/checkout@722adc6
+      - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       - uses: chrislennon/action-aws-cli@f0f8671
       - name: tag
         run: echo "::set-env name=TAG::`git log -1 --format=%h`"
@@ -33,7 +33,7 @@ jobs:
   linux_job:
     runs-on: ubuntu-18.04
     steps:
-      - uses: actions/checkout@722adc6
+      - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       - uses: chrislennon/action-aws-cli@f0f8671
       - name: tag
         run: echo "::set-env name=TAG::`git log -1 --format=%h`"
@@ -53,7 +53,7 @@ jobs:
   windows_job:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@722adc6
+      - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       - uses: chrislennon/action-aws-cli@f0f8671
       - name: tag
         run: |

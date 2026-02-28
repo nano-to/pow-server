@@ -10,7 +10,7 @@ jobs:
   osx_job:
     runs-on: macOS-latest
     steps:
-      - uses: actions/checkout@722adc6
+      - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       - name: Checkout Submodules
         run: git submodule update --init --recursive
       - name: fetch boost
@@ -21,7 +21,7 @@ jobs:
   linux_job:
     runs-on: ubuntu-18.04
     steps:
-      - uses: actions/checkout@722adc6
+      - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       - name: Checkout Submodules
         run: git submodule update --init --recursive
       - name: fetch boost
@@ -32,7 +32,7 @@ jobs:
   windows_job:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@722adc6
+      - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       - name: Checkout Submodules
         run: git submodule update --init --recursive
       - name: Build Artifact
