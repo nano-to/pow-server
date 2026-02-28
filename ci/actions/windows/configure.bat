@@ -5,7 +5,7 @@ echo "build %RUN%"
 
 cmake .. ^
     -Ax64 ^
-    -G"Visual Studio 16 2019" ^
+    -G"Visual Studio 17 2022" ^
     -DNANO_POW_STANDALONE=ON ^
     -DNANO_POW_SERVER_TEST=%TESTS% ^
     -DBoost_NO_SYSTEM_PATHS=TRUE ^
