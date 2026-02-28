@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 LOCAL_URL="http://127.0.0.1:8070"
-RPC_URL="https://rpc.nano.to"
+RPC_URL="${RPC_URL:-https://rpc.example.com}"
 
 HASHES=(
   "E89208DD038FBB269987689621D52292FE9B863A173550C797762D7329D0E0F7"

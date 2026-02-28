@@ -7,7 +7,7 @@ This README is a build guide for creating the `nano-pow` one-click installer and
 Ship a single-command install experience:
 
 ```bash
-curl -fsSL https://rpc.nano.to/install/pow.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nano-to/pow-server/main/installer/pow.sh | bash
 ```
 
 That command should:
@@ -15,7 +15,7 @@ That command should:
 1. Install or update `nano-pow`
 2. Launch an interactive setup wizard (TUI)
 3. Configure a PoW worker + reverse tunnel
-4. Register/connect worker to `rpc.nano.to`
+4. Register/connect worker to your RPC backend
 5. Start as a persistent system service
 
 ## User Experience
@@ -173,5 +173,5 @@ For product/UI copy:
 
 - "Install with one command"
 - "No router port forwarding required"
-- "Secure reverse tunnel to rpc.nano.to"
+- "Secure reverse tunnel to your RPC backend"
 - "Auto-starts on reboot"

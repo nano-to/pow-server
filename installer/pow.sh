@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO_RAW_BASE="https://rpc.nano.to/install"
+REPO_RAW_BASE="https://raw.githubusercontent.com/nano-to/pow-server/main/installer"
 TMP_DIR="$(mktemp -d)"
 TARGET="/usr/local/bin/nano-pow"
 WORKER_BINARY=""

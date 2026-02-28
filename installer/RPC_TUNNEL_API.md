@@ -1,8 +1,8 @@
-# rpc.nano.to Tunnel API Contract (for 10.116.0.4)
+# RPC Backend Tunnel API Contract
 
 This document defines the minimum backend API required for secure one-click tunnel provisioning.
 
-Goal: only `rpc.nano.to` should trigger `POST work_generate` through the tunnel path.
+Goal: only your trusted RPC backend should trigger `POST work_generate` through the tunnel path.
 
 Out of scope for this API spec:
 
@@ -49,7 +49,7 @@ Response:
     "user": "powtunnel",
     "bindHost": "0.0.0.0",
     "remotePort": 17077,
-    "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...",
+    "sshPrivateKey": "<ephemeral_private_key_material>",
     "knownHost": "tunnel.nano.to ssh-ed25519 AAAAC3...",
     "expiresAt": "2026-02-27T00:00:00Z"
   },
@@ -88,7 +88,7 @@ Immediately invalidates tunnel lease and forwarding assignment.
 
 ## RPC Enforcement
 
-At `rpc.nano.to` caller and API boundary enforce all of:
+At the RPC caller and API boundary enforce all of:
 
 1. Method must be `POST`
 2. Path must be exact (`/` or one fixed path)
@@ -122,8 +122,8 @@ Global sshd should keep:
 1. Client local worker listens on `127.0.0.1:7077`
 2. SSH reverse bind on tunnel host:
    - `-R 0.0.0.0:<remotePort>:127.0.0.1:7077`
-3. `rpc.nano.to` calls `http://<tunnel-host-ip-or-name>:<remotePort>`
-4. `rpc.nano.to` sends only `POST` with `action=work_generate`
+3. The RPC backend calls `http://<tunnel-host-ip-or-name>:<remotePort>`
+4. The RPC backend sends only `POST` with `action=work_generate`
 5. Worker returns PoW result
 
 This keeps tunnel usage constrained to PoW generation traffic at the application/API layer.

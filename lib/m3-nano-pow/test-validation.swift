@@ -2,11 +2,12 @@
 
 import Foundation
 
-// Quick test of rpc.nano.to validation
+// Quick test of RPC endpoint validation
 let testHash = "E89208DD038FBB269987689621D52292FE9B863A173550C797762D7329D0E0F7"
 let testWork = "0000000000000000" // Placeholder - this won't be valid, but tests the API
 
-let url = URL(string: "https://rpc.nano.to")!
+let rpcBase = ProcessInfo.processInfo.environment["RPC_URL"] ?? "https://rpc.example.com"
+let url = URL(string: rpcBase)!
 var request = URLRequest(url: url)
 request.httpMethod = "POST"
 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -19,7 +20,7 @@ let requestBody: [String: Any] = [
 
 request.httpBody = try? JSONSerialization.data(withJSONObject: requestBody)
 
-print("🧪 Testing rpc.nano.to work_validate API...")
+print("Testing \(rpcBase) work_validate API...")
 print("Block hash: \(testHash)")
 print("Work: \(testWork)")
 print("")
@@ -50,4 +51,4 @@ URLSession.shared.dataTask(with: request) { data, response, error in
 }.resume()
 
 semaphore.wait()
-print("\n✅ Test complete")
+print("\nTest complete")

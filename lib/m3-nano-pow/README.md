@@ -5,7 +5,7 @@ A GPU-accelerated Nano cryptocurrency proof-of-work generator for MacBook M3, us
 ## Features
 
 - 🚀 GPU-accelerated PoW generation using Metal
-- ✅ Automatic validation via rpc.nano.to
+- ✅ Automatic validation via your configured RPC endpoint
 - 🔄 Background service support
 - 💻 Optimized for M3 MacBook Air
 
@@ -78,7 +78,7 @@ tail -f ~/Library/Logs/nanopow.error.log
 
 The service will:
 1. Generate proof-of-work for Nano blocks using GPU acceleration
-2. Validate generated work using `https://rpc.nano.to/work_validate`
+2. Validate generated work using your RPC endpoint `/work_validate`
 3. Run continuously as a background service
 
 ### Testing
@@ -89,7 +89,7 @@ The service includes a test mode that generates PoW for a sample block hash and 
 
 1. **PoW Generation**: Uses Metal compute shaders to parallelize Blake2b hash computation on the GPU
 2. **Difficulty**: Finds a 64-bit work value such that `Blake2b(work || block_hash)` meets the difficulty threshold
-3. **Validation**: Sends generated work to `rpc.nano.to` for validation before accepting it
+3. **Validation**: Sends generated work to your RPC endpoint for validation before accepting it
 
 ## Performance
 
@@ -102,7 +102,7 @@ On M3 MacBook Air:
 - **Blake2b Hashing**: Currently uses a placeholder implementation (SHA512 fallback for testing)
 - **Parallel Processing**: Uses Swift concurrency (async/await) for parallel work value testing across multiple CPU cores
 - **GPU Acceleration**: Metal framework initialized and ready for future GPU optimization
-- **Validation**: All generated work is validated via `rpc.nano.to/work_validate` before acceptance
+- **Validation**: All generated work is validated via your RPC endpoint before acceptance
 - **Nano PoW Algorithm**: Finds 64-bit work value where `Blake2b(work || block_hash)` meets difficulty threshold
 
 ## Important Notes
@@ -111,7 +111,7 @@ On M3 MacBook Air:
 
 - The current implementation uses optimized CPU-based hashing with parallel processing
 - Metal GPU shaders are initialized but full GPU acceleration requires implementing Blake2b in Metal
-- The service automatically validates all generated work via rpc.nano.to
+- The service automatically validates all generated work via your RPC endpoint
 - For production, implement full Blake2b algorithm (preferably in Metal shaders for maximum GPU utilization)
 
 ## Next Steps for Production
@@ -123,7 +123,7 @@ On M3 MacBook Air:
 ## Troubleshooting
 
 - **Metal not available**: Ensure you're running on a Mac with Metal support
-- **Validation fails**: Check network connection to rpc.nano.to
+- **Validation fails**: Check network connection to your RPC endpoint
 - **Service won't start**: Check logs in `~/Library/Logs/nanopow.log`
 
 ## License

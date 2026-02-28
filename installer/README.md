@@ -1,6 +1,6 @@
 # NANO.TO PoW Installer + Tunnel Test Guide
 
-Use this guide to test PoW locally first, then verify a private reverse tunnel consumed only by `rpc.nano.to`.
+Use this guide to test PoW locally first, then verify a private reverse tunnel consumed only by your RPC backend.
 
 ## Quick Local Test (No Config, No API Key)
 
@@ -27,10 +27,10 @@ curl -sS -X POST "http://127.0.0.1:7077" -H "Content-Type: application/json" --d
 If your backend implements the bootstrap endpoint, users can run:
 
 ```bash
-curl -fsSL https://rpc.nano.to/install/pow.sh | WORK_API_KEY="<work_api_key>" bash
+curl -fsSL https://raw.githubusercontent.com/nano-to/pow-server/main/installer/pow.sh | WORK_API_KEY="<work_api_key>" bash
 ```
 
-This auto-provisions tunnel settings from `rpc.nano.to`, starts worker + tunnel, and avoids manual SSH details.
+This auto-provisions tunnel settings from your backend, starts worker + tunnel, and avoids manual SSH details.
 
 ## Reverse Tunnel Test (RPC-Only, Private)
 
@@ -54,7 +54,7 @@ autossh -M 0 -N \
 ```
 
 On tunnel host, firewall must only allow `10.116.0.4 -> 17000:17999` and deny public sources.
-Now from `rpc.nano.to` (`10.116.0.4`), test the tunnel target directly:
+Now from your backend host, test the tunnel target directly:
 
 ```bash
 curl -sS -X POST "http://142.93.62.146:17077" -H "Content-Type: application/json" --data '{"action":"work_generate","hash":"E89208DD038FBB269987689621D52292FE9B863A173550C797762D7329D0E0F7"}'
