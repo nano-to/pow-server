@@ -9,7 +9,8 @@ WORKER_BINARY=""
 
 script_dir() {
   local script_path
-  script_path="${BASH_SOURCE[0]}"
+  script_path="${BASH_SOURCE[0]:-}"
+  [[ -z "$script_path" ]] && return 1
   cd -- "$(dirname -- "$script_path")" >/dev/null 2>&1 && pwd -P
 }
 
@@ -152,10 +153,13 @@ prepare_worker_source() {
   local bundled_source="${NANO_POW_BUNDLED_WORK_SOURCE_DIR:-}"
 
   if [[ -z "$bundled_source" ]]; then
-    local candidate
-    candidate="$(script_dir)/../nano-work-server"
-    if [[ -f "$candidate/Cargo.toml" ]]; then
-      bundled_source="$candidate"
+    local candidate script_dir_result
+    script_dir_result="$(script_dir 2>/dev/null || true)"
+    if [[ -n "$script_dir_result" ]]; then
+      candidate="$script_dir_result/../nano-work-server"
+      if [[ -f "$candidate/Cargo.toml" ]]; then
+        bundled_source="$candidate"
+      fi
     fi
   fi
 
