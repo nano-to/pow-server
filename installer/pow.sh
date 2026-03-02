@@ -9,7 +9,8 @@ WORKER_BINARY=""
 
 script_dir() {
   local script_path
-  script_path="${BASH_SOURCE[0]}"
+  script_path="${BASH_SOURCE[0]:-}"
+  [[ -z "$script_path" ]] && return 1
   cd -- "$(dirname -- "$script_path")" >/dev/null 2>&1 && pwd -P
 }
 
