@@ -40,7 +40,51 @@ log_info() { [[ "$QUIET_MODE" == "1" ]] && return 0; printf "%b[INFO]%b %s\n" "$
 log_ok() { [[ "$QUIET_MODE" == "1" ]] && return 0; printf "%b[ OK ]%b %s\n" "$GREEN" "$RESET" "$*"; }
 log_warn() { [[ "$QUIET_MODE" == "1" ]] && return 0; printf "%b[WARN]%b %s\n" "$YELLOW" "$RESET" "$*"; }
 log_err() { printf "%b[ERR ]%b %s\n" "$RED" "$RESET" "$*" >&2; }
-die() { log_err "$*"; exit 1; }
+install_trace() {
+  local msg="$*"
+  local ts
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || printf "")"
+  if [[ -n "${RUN_DIR:-}" ]]; then
+    mkdir -p "$RUN_DIR" >/dev/null 2>&1 || true
+    printf "%s %s\n" "$ts" "$msg" >> "$RUN_DIR/install.trace"
+  fi
+}
+
+compact_text() {
+  local text="$1"
+  text="${text//$'\r'/ }"
+  text="${text//$'\n'/ }"
+  text="${text//$'\t'/ }"
+  while [[ "$text" == *"  "* ]]; do
+    text="${text//  / }"
+  done
+  printf "%s" "$text"
+}
+
+last_nonempty_line() {
+  local file_path="$1"
+  local max_lines="${2:-60}"
+  local line=""
+  local candidate=""
+  [[ -f "$file_path" ]] || return 1
+
+  while IFS= read -r line; do
+    candidate="$(compact_text "$line")"
+    if [[ -n "$candidate" ]]; then
+      line="$candidate"
+    fi
+  done < <(tail -n "$max_lines" "$file_path" 2>/dev/null)
+
+  [[ -n "$line" ]] || return 1
+  printf "%s" "$line"
+}
+
+die() {
+  local msg="$*"
+  install_trace "fatal: $msg"
+  log_err "$msg"
+  exit 1
+}
 
 need_cmd() {
   local cmd="$1"
@@ -535,6 +579,46 @@ heartbeat_once() {
   [[ -f "$CONFIG_FILE" ]] || return 1
   api_key_present || return 2
 
+  heartbeat_compose_error() {
+    local status="$1"
+    local body_file="$2"
+    local curl_err_file="$3"
+    local raw msg curl_err ngrok_code
+
+    raw="$(cat "$body_file" 2>/dev/null || printf '')"
+    raw="${raw//$'\r'/ }"
+    raw="${raw//$'\n'/ }"
+
+    msg=""
+    if [[ -n "$raw" ]] && command -v jq >/dev/null 2>&1; then
+      msg="$(jq -r 'try (if type=="object" then (.error // .message // .detail // .response.error // .response.message // empty) else empty end) catch empty' <<<"$raw" 2>/dev/null || printf '')"
+    fi
+
+    if [[ -z "$msg" && "$raw" =~ ERR_NGROK_([0-9]+) ]]; then
+      ngrok_code="${BASH_REMATCH[1]}"
+      msg="ngrok endpoint offline (ERR_NGROK_${ngrok_code})"
+    fi
+
+    curl_err="$(cat "$curl_err_file" 2>/dev/null || printf '')"
+    curl_err="${curl_err//$'\r'/ }"
+    curl_err="${curl_err//$'\n'/ }"
+
+    if [[ -z "$msg" && -n "$curl_err" ]]; then
+      msg="$curl_err"
+    fi
+
+    if [[ -z "$msg" ]]; then
+      if [[ "$status" == "000" ]]; then
+        msg="network request failed"
+      else
+        msg="unexpected response"
+      fi
+    fi
+
+    msg="${msg:0:180}"
+    printf "HTTP %s: %s" "${status:-unknown}" "$msg"
+  }
+
   local api_key worker_name labels tunnel_host tunnel_public_host tunnel_public_url remote_port local_port ssh_key_path ssh_public_key provider ngrok_credential_id
   api_key="$(cfg_required '.apiKey')"
   worker_name="$(cfg_get '.workerName' 2>/dev/null || printf "")"
@@ -579,22 +663,29 @@ heartbeat_once() {
     compute_mode="unknown"
   fi
 
-  local payload status_file body_file status
+  local payload status_file body_file curl_err_file error_file status summary
   payload="{\"workerName\":\"${worker_name}\",\"labels\":\"${labels}\",\"localPort\":${local_port},\"tunnelHost\":\"${tunnel_public_host}\",\"tunnelPort\":\"${remote_port}\",\"tunnelUrl\":\"${tunnel_public_url}\",\"version\":\"${VERSION}\",\"sshPublicKey\":\"${ssh_public_key}\",\"ngrokCredentialId\":\"${ngrok_credential_id}\",\"os\":\"${OS}\",\"arch\":\"${ARCH}\",\"gpuVendor\":\"${GPU_VENDOR}\",\"computeMode\":\"${compute_mode}\"}"
   status_file="$RUN_DIR/heartbeat.http"
   body_file="$RUN_DIR/heartbeat.body"
+  curl_err_file="$RUN_DIR/heartbeat.curl.err"
+  error_file="$RUN_DIR/heartbeat.error"
 
   status="$(curl -sS -o "$body_file" -w "%{http_code}" \
     -X POST "${RPC_API_BASE}/api/account/work-servers/heartbeat" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${api_key}" \
-    --data "$payload" || true)"
+    --data "$payload" 2>"$curl_err_file" || true)"
 
   printf "%s" "$status" > "$status_file"
   if [[ "$status" == "200" || "$status" == "204" ]]; then
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "$RUN_DIR/heartbeat.last_success"
+    rm -f "$error_file" "$curl_err_file"
     return 0
   fi
+
+  summary="$(heartbeat_compose_error "$status" "$body_file" "$curl_err_file")"
+  printf "%s\n" "$summary" > "$error_file"
+  printf "%s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$summary" >> "$LOG_DIR/heartbeat.err.log"
   return 1
 }
 
@@ -648,8 +739,12 @@ one_click_cmd() {
   shift || true
   detect_platform
   ensure_dirs
+  install_trace "one-click: start"
+  install_trace "one-click: install_deps"
   install_deps
+  install_trace "one-click: ensure_gpu_readiness"
   ensure_gpu_readiness
+  install_trace "one-click: ensure_worker_binary"
   ensure_worker_binary
 
   local api_key="${NANO_POW_API_KEY:-}"
@@ -695,6 +790,7 @@ one_click_cmd() {
   bootstrap_worker_name="pow-$(random_short_id)"
 
   log_info "Provisioning secure tunnel from backend"
+  install_trace "one-click: bootstrap_tunnel"
   local bundle
   if ! bundle="$(bootstrap_tunnel_bundle "$api_key" "$bootstrap_worker_name" "$local_port")"; then
     die "Tunnel bootstrap failed. Ensure RPC endpoint /api/account/work-servers/bootstrap-tunnel is available."
@@ -763,8 +859,11 @@ one_click_cmd() {
 
   write_config "$api_key" "" "0" "$worker_name" "auto,managed" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_port" "$ssh_key" "$worker_bin" "$tunnel_enabled" "$tunnel_bind_host" "$tunnel_public_host" "$tunnel_provider_value" "$ngrok_authtoken" "$ngrok_domain" "$tunnel_public_url" "$ngrok_credential_id" "$ngrok_allowed_cidrs"
 
+  install_trace "one-click: install_service"
   install_service
+  install_trace "one-click: start_cmd"
   start_cmd
+  install_trace "one-click: success"
 
   printf "\n%bNANO.TO POW SERVER%b ready\n" "$BOLD$GREEN" "$RESET"
   printf "Run: %s status --watch\n" "$CLI_NAME"
@@ -1095,8 +1194,12 @@ render_step() {
 setup_cmd() {
   detect_platform
   ensure_dirs
+  install_trace "setup: start"
+  install_trace "setup: install_deps"
   install_deps
+  install_trace "setup: ensure_gpu_readiness"
   ensure_gpu_readiness
+  install_trace "setup: ensure_worker_binary"
   ensure_worker_binary
 
   local worker_bin
@@ -1211,13 +1314,18 @@ setup_cmd() {
   fi
 
   if [[ "$no_tunnel" != "true" ]]; then
+    install_trace "setup: validate_api_key"
     validate_api_key_remote "$api_key"
+    install_trace "setup: register_worker"
     register_worker_remote "$api_key" "$payout" "$bid" "$worker_name" "$labels"
   fi
   write_config "$api_key" "$payout" "$bid" "$worker_name" "$labels" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_remote_port" "$ssh_key" "$worker_bin" "$([[ "$no_tunnel" == "true" ]] && printf "false" || printf "true")" "127.0.0.1" "$tunnel_public_host" "reverse-ssh" "" "" "" "" ""
 
+  install_trace "setup: install_service"
   install_service
+  install_trace "setup: start_cmd"
   start_cmd
+  install_trace "setup: success"
 
   log_ok "Setup complete"
   if [[ "$no_tunnel" == "true" ]]; then
@@ -1648,6 +1756,25 @@ status_line() {
   printf "%-16s %b\n" "Tunnel" "$tunnel_status"
   printf "%-16s %b\n" "Local API" "$api_status"
   printf "%-16s %b\n" "Heartbeat" "$hb_status"
+
+  if [[ -f "$RUN_DIR/heartbeat.error" ]]; then
+    local hb_error
+    hb_error="$(cat "$RUN_DIR/heartbeat.error" 2>/dev/null || printf '')"
+    if [[ -n "$hb_error" ]]; then
+      printf "%-16s %s\n" "Heartbeat err" "${hb_error:0:120}"
+    fi
+  fi
+
+  local server_err install_last
+  server_err="$(last_nonempty_line "$LOG_DIR/worker.err.log" 80 2>/dev/null || printf '')"
+  if [[ -n "$server_err" ]]; then
+    printf "%-16s %s\n" "Server err" "${server_err:0:120}"
+  fi
+
+  install_last="$(last_nonempty_line "$RUN_DIR/install.trace" 60 2>/dev/null || printf '')"
+  if [[ -n "$install_last" ]]; then
+    printf "%-16s %s\n" "Install" "${install_last:0:120}"
+  fi
 }
 
 status_cmd() {
@@ -1821,9 +1948,14 @@ tunnel_cmd() {
   if heartbeat_once; then
     log_ok "Tunnel mode active; heartbeat sent"
   else
-    local code
+    local code heartbeat_err
     code="$(cat "$RUN_DIR/heartbeat.http" 2>/dev/null || printf "unknown")"
-    log_warn "Tunnel mode active; heartbeat pending (HTTP ${code})"
+    heartbeat_err="$(cat "$RUN_DIR/heartbeat.error" 2>/dev/null || printf '')"
+    if [[ -n "$heartbeat_err" ]]; then
+      log_warn "Tunnel mode active; heartbeat pending (${heartbeat_err})"
+    else
+      log_warn "Tunnel mode active; heartbeat pending (HTTP ${code})"
+    fi
   fi
 }
 
