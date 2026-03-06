@@ -450,6 +450,18 @@ install_ngrok_if_missing() {
       ;;
     linux)
       if command -v apt-get >/dev/null 2>&1; then
+        local ngrok_repo_url ngrok_repo_dist
+        ngrok_repo_url="https://ngrok-agent.s3.amazonaws.com"
+        ngrok_repo_dist="bookworm"
+
+        if ! curl -fsSL "${ngrok_repo_url}/ngrok.asc" | run_with_sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null; then
+          die "Failed to install ngrok apt signing key. Install manually from https://ngrok.com/download"
+        fi
+
+        if ! printf "deb %s %s main\n" "$ngrok_repo_url" "$ngrok_repo_dist" | run_with_sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null; then
+          die "Failed to configure ngrok apt repository. Install manually from https://ngrok.com/download"
+        fi
+
         run_with_sudo apt-get update
         run_with_sudo apt-get install -y ngrok || die "Failed to install ngrok via apt. Install manually from https://ngrok.com/download"
       elif command -v dnf >/dev/null 2>&1; then
