@@ -6,6 +6,7 @@ VERSION="0.1.0"
 CLI_NAME="nano-pow"
 RPC_HOST="${RPC_HOST:-rpc.nano.to}"
 RPC_API_BASE="${RPC_API_BASE:-https://rpc.nano.to}"
+DEFAULT_TUNNEL_PROVIDER="${NANO_POW_TUNNEL_PROVIDER:-frp}"
 
 OS=""
 ARCH=""
@@ -21,6 +22,7 @@ LOG_DIR="${STATE_DIR}/logs"
 RUN_DIR="${STATE_DIR}/run"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 NGROK_POLICY_FILE="${CONFIG_DIR}/ngrok-traffic-policy.json"
+FRP_CONFIG_FILE="${CONFIG_DIR}/frpc.toml"
 
 MAC_WORKER_LABEL="com.nano.pow.worker"
 MAC_TUNNEL_LABEL="com.nano.pow.tunnel"
@@ -476,7 +478,59 @@ install_ngrok_if_missing() {
   esac
 
   command -v ngrok >/dev/null 2>&1 || die "ngrok install did not complete correctly"
-  log_ok "ngrok installed"
+	log_ok "ngrok installed"
+}
+
+install_frpc_if_missing() {
+  if command -v frpc >/dev/null 2>&1; then
+    return 0
+  fi
+
+  detect_platform
+  need_cmd curl
+  need_cmd jq
+  need_cmd tar
+
+  local frp_os frp_arch latest version archive url tmp_dir frpc_bin install_dir target
+  case "$OS" in
+    mac) frp_os="darwin" ;;
+    linux) frp_os="linux" ;;
+    *) die "frp tunnel mode is not supported on this OS yet" ;;
+  esac
+
+  case "$ARCH" in
+    amd64|arm64) frp_arch="$ARCH" ;;
+    *) die "frp tunnel mode is not supported on architecture: $ARCH" ;;
+  esac
+
+  latest="$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | jq -r '.tag_name // empty')"
+  [[ -n "$latest" && "$latest" != "null" ]] || die "Unable to resolve latest frp release"
+  version="${latest#v}"
+  archive="frp_${version}_${frp_os}_${frp_arch}.tar.gz"
+  url="https://github.com/fatedier/frp/releases/download/${latest}/${archive}"
+  tmp_dir="$(mktemp -d)"
+
+  log_info "Installing frpc ${latest}"
+  curl -fsSL "$url" -o "$tmp_dir/$archive" || die "Failed to download frpc from $url"
+  tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+  frpc_bin="$(find "$tmp_dir" -type f -name frpc -perm -111 | head -n 1)"
+  [[ -n "$frpc_bin" && -x "$frpc_bin" ]] || die "Downloaded frp archive did not contain frpc"
+
+  install_dir="/usr/local/bin"
+  target="$install_dir/frpc"
+  if [[ -w "$install_dir" ]]; then
+    install -m 0755 "$frpc_bin" "$target"
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo install -m 0755 "$frpc_bin" "$target"
+  else
+    mkdir -p "$HOME/.local/bin"
+    install -m 0755 "$frpc_bin" "$HOME/.local/bin/frpc"
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+
+  rm -rf "$tmp_dir"
+  command -v frpc >/dev/null 2>&1 || die "frpc install did not complete correctly"
+  log_ok "frpc installed"
 }
 
 install_local_deps() {
@@ -740,12 +794,13 @@ bootstrap_tunnel_bundle() {
   local api_key="$1"
   local worker_name="$2"
   local local_port="$3"
+  local transport="${DEFAULT_TUNNEL_PROVIDER:-frp}"
 
   curl -fsS \
     -X POST "${RPC_API_BASE}/api/account/work-servers/bootstrap-tunnel" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${api_key}" \
-    --data "{\"workerName\":\"${worker_name}\",\"localPort\":${local_port},\"transport\":\"ngrok\",\"allowedActions\":[\"work_generate\"],\"allowedMethods\":[\"POST\"]}"
+    --data "{\"workerName\":\"${worker_name}\",\"localPort\":${local_port},\"transport\":\"${transport}\",\"allowedActions\":[\"work_generate\"],\"allowedMethods\":[\"POST\"]}"
 }
 
 one_click_cmd() {
@@ -817,7 +872,7 @@ one_click_cmd() {
     end
   ' <<<"$bundle" 2>/dev/null || printf '{}')"
 
-  local tunnel_host tunnel_user tunnel_port tunnel_enabled tunnel_bind_host worker_bin tunnel_public_host tunnel_public_url tunnel_provider_value ngrok_domain ngrok_authtoken ngrok_credential_id ngrok_allowed_cidrs
+  local tunnel_host tunnel_user tunnel_port tunnel_enabled tunnel_bind_host worker_bin tunnel_public_host tunnel_public_url tunnel_provider_value ngrok_domain ngrok_authtoken ngrok_credential_id ngrok_allowed_cidrs frp_token frp_subdomain
   tunnel_host="$(jq -r '.tunnel.host // empty' <<<"$normalized_bundle")"
   tunnel_user="$(jq -r '.tunnel.user // empty' <<<"$normalized_bundle")"
   tunnel_port="$(jq -r '.tunnel.remotePort // empty' <<<"$normalized_bundle")"
@@ -830,6 +885,8 @@ one_click_cmd() {
   ngrok_authtoken="$(jq -r '.tunnel.ngrokAuthtoken // empty' <<<"$normalized_bundle")"
   ngrok_credential_id="$(jq -r '.tunnel.ngrokCredentialId // empty' <<<"$normalized_bundle")"
   ngrok_allowed_cidrs="$(jq -r '(.policy.allowedSourceCidrs // .tunnel.allowedCidrs // []) | join(",")' <<<"$normalized_bundle")"
+  frp_token="$(jq -r '.tunnel.frpToken // empty' <<<"$normalized_bundle")"
+  frp_subdomain="$(jq -r '.tunnel.frpSubdomain // empty' <<<"$normalized_bundle")"
   worker_bin="$(worker_binary_path)"
 
   if [[ "$tunnel_provider_value" == "ngrok" ]]; then
@@ -843,6 +900,12 @@ one_click_cmd() {
       ngrok_authtoken=""
       log_warn "Bootstrap payload did not include ngrok authtoken; expecting ngrok account auth to already be configured on this machine."
     fi
+  elif [[ "$tunnel_provider_value" == "frp" ]]; then
+    install_frpc_if_missing
+    tunnel_user=""
+    tunnel_bind_host="127.0.0.1"
+    ssh_key=""
+    [[ -n "$tunnel_host" && -n "$tunnel_port" && -n "$frp_token" && -n "$frp_subdomain" ]] || die "Invalid frp tunnel bootstrap payload"
   else
     [[ -n "$tunnel_host" && -n "$tunnel_user" && -n "$tunnel_port" ]] || die "Invalid tunnel bootstrap payload"
 
@@ -870,7 +933,7 @@ one_click_cmd() {
     fi
   fi
 
-  write_config "$api_key" "" "0" "$worker_name" "auto,managed" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_port" "$ssh_key" "$worker_bin" "$tunnel_enabled" "$tunnel_bind_host" "$tunnel_public_host" "$tunnel_provider_value" "$ngrok_authtoken" "$ngrok_domain" "$tunnel_public_url" "$ngrok_credential_id" "$ngrok_allowed_cidrs"
+  write_config "$api_key" "" "0" "$worker_name" "auto,managed" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_port" "$ssh_key" "$worker_bin" "$tunnel_enabled" "$tunnel_bind_host" "$tunnel_public_host" "$tunnel_provider_value" "$ngrok_authtoken" "$ngrok_domain" "$tunnel_public_url" "$ngrok_credential_id" "$ngrok_allowed_cidrs" "$frp_token" "$frp_subdomain"
 
   install_trace "one-click: install_service"
   install_service
@@ -1121,6 +1184,8 @@ write_config() {
   local tunnel_public_url="${18:-}"
   local ngrok_credential_id="${19:-}"
   local ngrok_allowed_cidrs="${20:-}"
+  local frp_token="${21:-}"
+  local frp_subdomain="${22:-}"
 
   local worker_args
   if is_nano_work_server_binary "$worker_bin"; then
@@ -1153,7 +1218,9 @@ write_config() {
     "ngrokDomain": "${ngrok_domain}",
     "ngrokAuthtoken": "${ngrok_authtoken}",
     "ngrokCredentialId": "${ngrok_credential_id}",
-    "ngrokAllowedCidrs": "${ngrok_allowed_cidrs}"
+    "ngrokAllowedCidrs": "${ngrok_allowed_cidrs}",
+    "frpToken": "${frp_token}",
+    "frpSubdomain": "${frp_subdomain}"
   },
   "worker": {
     "binary": "${worker_bin}",
@@ -1197,6 +1264,36 @@ write_ngrok_policy_file() {
 }
 EOF
   chmod 600 "$NGROK_POLICY_FILE"
+}
+
+write_frpc_config_file() {
+  local server_addr server_port local_port token subdomain name
+  server_addr="$(cfg_required '.tunnel.host')"
+  server_port="$(cfg_required '.tunnel.remotePort')"
+  local_port="$(cfg_required '.localPort')"
+  token="$(cfg_required '.tunnel.frpToken')"
+  subdomain="$(cfg_required '.tunnel.frpSubdomain')"
+  name="$(cfg_get '.workerName' 2>/dev/null || printf 'nano-pow')"
+  name="$(printf "%s" "$name" | tr -c 'A-Za-z0-9_-' '-')"
+
+  umask 077
+  cat > "$FRP_CONFIG_FILE" <<EOF
+serverAddr = "${server_addr}"
+serverPort = ${server_port}
+
+auth.method = "token"
+auth.token = "${token}"
+
+transport.tls.enable = true
+
+[[proxies]]
+name = "${name}-${subdomain}"
+type = "http"
+localIP = "127.0.0.1"
+localPort = ${local_port}
+subdomain = "${subdomain}"
+EOF
+  chmod 600 "$FRP_CONFIG_FILE"
 }
 
 render_step() {
@@ -1332,7 +1429,7 @@ setup_cmd() {
     install_trace "setup: register_worker"
     register_worker_remote "$api_key" "$payout" "$bid" "$worker_name" "$labels"
   fi
-  write_config "$api_key" "$payout" "$bid" "$worker_name" "$labels" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_remote_port" "$ssh_key" "$worker_bin" "$([[ "$no_tunnel" == "true" ]] && printf "false" || printf "true")" "127.0.0.1" "$tunnel_public_host" "reverse-ssh" "" "" "" "" ""
+  write_config "$api_key" "$payout" "$bid" "$worker_name" "$labels" "$local_port" "$tunnel_user" "$tunnel_host" "$tunnel_remote_port" "$ssh_key" "$worker_bin" "$([[ "$no_tunnel" == "true" ]] && printf "false" || printf "true")" "127.0.0.1" "$tunnel_public_host" "reverse-ssh" "" "" "" "" "" "" ""
 
   install_trace "setup: install_service"
   install_service
@@ -1447,6 +1544,39 @@ write_mac_tunnel_plist() {
       ${ngrok_url_arg}
       ${ngrok_policy_arg}
       <string>127.0.0.1:${local_port}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/tunnel.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/tunnel.err.log</string>
+  </dict>
+</plist>
+EOF
+    return 0
+  fi
+
+  if [[ "$provider" == "frp" ]]; then
+    local frpc_bin
+    frpc_bin="$(command -v frpc 2>/dev/null || printf '')"
+    [[ -n "$frpc_bin" ]] || die "frpc not found. Re-run setup/one-click to install it."
+    write_frpc_config_file
+
+    cat > "$(mac_tunnel_plist_path)" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${MAC_TUNNEL_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${frpc_bin}</string>
+      <string>-c</string>
+      <string>${FRP_CONFIG_FILE}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -1585,6 +1715,25 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/env ngrok http${ngrok_token_arg}${ngrok_url_arg}${ngrok_policy_arg} 127.0.0.1:${local_port}
+Restart=always
+RestartSec=2
+StandardOutput=append:${LOG_DIR}/tunnel.out.log
+StandardError=append:${LOG_DIR}/tunnel.err.log
+
+[Install]
+WantedBy=default.target
+EOF
+  elif [[ "$provider" == "frp" ]]; then
+    write_frpc_config_file
+
+  cat > "$systemd_dir/$LINUX_TUNNEL_UNIT" <<EOF
+[Unit]
+Description=Nano PoW frp Tunnel
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env frpc -c ${FRP_CONFIG_FILE}
 Restart=always
 RestartSec=2
 StandardOutput=append:${LOG_DIR}/tunnel.out.log
@@ -1813,6 +1962,9 @@ status_cmd() {
       printf "%-16s %s\n" "Tunnel mode" "$provider"
       if [[ "$provider" == "ngrok" ]]; then
         printf "%-16s %s\n" "Public URL" "$(cfg_get '.tunnel.publicUrl' 2>/dev/null || printf 'https://unknown.ngrok.app')"
+      elif [[ "$provider" == "frp" ]]; then
+        printf "%-16s %s\n" "Public URL" "$(cfg_get '.tunnel.publicUrl' 2>/dev/null || printf 'https://unknown.tunnel.nano.to')"
+        printf "%-16s %s\n" "FRP server" "$(cfg_required '.tunnel.host'):$(cfg_required '.tunnel.remotePort')"
       else
         printf "%-16s %s\n" "RPC host" "$(cfg_required '.tunnel.host')"
         printf "%-16s %s\n" "Bind host" "$(cfg_get '.tunnel.bindHost' 2>/dev/null || printf '127.0.0.1')"
@@ -1896,6 +2048,9 @@ start_cmd() {
               fi
             fi
           fi
+        elif [[ "$provider" == "frp" ]]; then
+          write_frpc_config_file
+          nohup frpc -c "$FRP_CONFIG_FILE" >>"$LOG_DIR/tunnel.out.log" 2>>"$LOG_DIR/tunnel.err.log" &
         else
           host="$(cfg_required '.tunnel.host')"
           user="$(cfg_required '.tunnel.user')"
@@ -2004,7 +2159,7 @@ doctor_cmd() {
   printf "%-20s %s\n" "GPU" "$GPU_VENDOR"
   printf "%-20s %s\n" "Config" "$CONFIG_FILE"
   printf "\nDependencies:\n"
-  for dep in curl jq ssh autossh ngrok; do
+  for dep in curl jq ssh autossh ngrok frpc; do
     if command -v "$dep" >/dev/null 2>&1; then
       printf "  - %-12s %bOK%b\n" "$dep" "$GREEN" "$RESET"
     else

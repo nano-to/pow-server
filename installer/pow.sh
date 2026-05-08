@@ -152,16 +152,22 @@ prepare_worker_source() {
   local work_repo_url="${NANO_POW_WORK_REPO_URL:-https://github.com/nanocurrency/nano-work-server.git}"
   local bundled_source="${NANO_POW_BUNDLED_WORK_SOURCE_DIR:-}"
 
-  if [[ -z "$bundled_source" ]]; then
-    local candidate script_dir_result
-    script_dir_result="$(script_dir 2>/dev/null || true)"
-    if [[ -n "$script_dir_result" ]]; then
-      candidate="$script_dir_result/../nano-work-server"
-      if [[ -f "$candidate/Cargo.toml" ]]; then
-        bundled_source="$candidate"
-      fi
-    fi
-  fi
+	if [[ -z "$bundled_source" ]]; then
+		local candidate script_dir_result
+		script_dir_result="$(script_dir 2>/dev/null || true)"
+		if [[ -n "$script_dir_result" ]]; then
+			candidate="$script_dir_result/.."
+			if [[ -f "$candidate/CMakeLists.txt" || -d "$candidate/lib/m3-nano-pow" ]]; then
+				bundled_source="$candidate"
+			fi
+		fi
+		if [[ -z "$bundled_source" && -n "$script_dir_result" ]]; then
+			candidate="$script_dir_result/../nano-work-server"
+			if [[ -f "$candidate/Cargo.toml" || -f "$candidate/CMakeLists.txt" ]]; then
+				bundled_source="$candidate"
+			fi
+		fi
+	fi
 
   if command -v nano-work-server >/dev/null 2>&1; then
     export NANO_POW_WORKER_BINARY="$(command -v nano-work-server)"
@@ -169,18 +175,18 @@ prepare_worker_source() {
     return 0
   fi
 
-  if [[ -f "$source_root/Cargo.toml" ]]; then
-    export NANO_POW_SOURCE_DIR="$source_root"
-    log "Using existing worker source tree: $source_root"
-    return 0
-  fi
+	if [[ -f "$source_root/Cargo.toml" || -f "$source_root/CMakeLists.txt" || -d "$source_root/lib/m3-nano-pow" ]]; then
+		export NANO_POW_SOURCE_DIR="$source_root"
+		log "Using existing worker source tree: $source_root"
+		return 0
+	fi
 
   mkdir -p "$source_base"
 
-  if [[ -n "$bundled_source" && -f "$bundled_source/Cargo.toml" ]]; then
-    rm -rf "$source_root"
-    mkdir -p "$source_root"
-    cp -R "$bundled_source/." "$source_root/"
+	if [[ -n "$bundled_source" && ( -f "$bundled_source/Cargo.toml" || -f "$bundled_source/CMakeLists.txt" || -d "$bundled_source/lib/m3-nano-pow" ) ]]; then
+		rm -rf "$source_root"
+		mkdir -p "$source_root"
+		cp -R "$bundled_source/." "$source_root/"
     rm -rf "$source_root/.git"
     log "Copied bundled worker source from $bundled_source"
   elif [[ -d "$source_root/.git" ]]; then
