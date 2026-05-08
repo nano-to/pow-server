@@ -33,6 +33,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
+      - name: Validate PowerShell installer syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("installer/pow.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
       - name: Checkout Submodules
         run: git submodule update --init --recursive
       - name: Build Artifact

@@ -219,7 +219,7 @@ main() {
   case "$os" in
     linux) install_deps_linux ;;
     mac) install_deps_mac ;;
-    windows) log "Run installer in WSL2 for best support" ;;
+    windows) log "Use the native PowerShell installer: iwr https://raw.githubusercontent.com/nano-to/pow-server/main/installer/pow.ps1 -UseB | iex" ;;
     *) log "Unsupported OS"; exit 1 ;;
   esac
 

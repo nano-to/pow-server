@@ -26,11 +26,29 @@ curl -sS -X POST "http://127.0.0.1:7077" -H "Content-Type: application/json" --d
 
 If your backend implements the bootstrap endpoint, users can run:
 
+macOS/Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nano-to/pow-server/main/installer/pow.sh | WORK_API_KEY="<work_api_key>" bash
 ```
 
+Windows PowerShell:
+
+```powershell
+$env:WORK_API_KEY = "<work_api_key>"
+iwr https://raw.githubusercontent.com/nano-to/pow-server/main/installer/pow.ps1 -UseB | iex
+```
+
 This auto-provisions tunnel settings from your backend, starts worker + tunnel, and avoids manual SSH details.
+
+The Windows installer is native PowerShell and avoids compiling on the user's machine. It downloads the latest prebuilt `nano_pow_server` Windows artifact, downloads `frpc.exe`, writes `%LOCALAPPDATA%\NanoPow\config`, creates `NanoPowWorker` and `NanoPowTunnel` Scheduled Tasks, starts both tasks, runs a local `work_generate` probe, and sends a heartbeat to `rpc.nano.to`.
+
+Windows GPU notes:
+
+- NVIDIA users should have current NVIDIA drivers installed; the installer checks for `nvidia-smi.exe` and warns if it is missing.
+- AMD users should have AMD Adrenalin/OpenCL runtime installed; the installer detects Radeon/AMD adapters through WMI.
+- If no AMD/NVIDIA adapter is detected, the generated worker config uses CPU mode instead of failing mid-install.
+- Diagnostics are installed at `%LOCALAPPDATA%\NanoPow\scripts\doctor.ps1`.
 
 ## Reverse Tunnel Test (RPC-Only, Private)
 
@@ -68,3 +86,4 @@ No public endpoint should proxy this traffic.
 
 - `installer/nano-pow`: main CLI and local TUI
 - `installer/pow.sh`: curl-pipe bootstrap installer
+- `installer/pow.ps1`: native Windows PowerShell one-click installer
