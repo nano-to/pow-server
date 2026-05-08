@@ -15,7 +15,7 @@ script_dir() {
 }
 
 can_use_sudo() {
-  command -v sudo >/dev/null 2>&1 && [[ -t 0 ]]
+  command -v sudo >/dev/null 2>&1 && { [[ -t 0 ]] || sudo -n true >/dev/null 2>&1; }
 }
 
 cleanup() {
@@ -117,13 +117,41 @@ detect_arch() {
 }
 
 install_deps_linux() {
+  log "Checking Linux dependencies"
+  local deps missing dep
+  deps=(curl jq git)
+  missing=()
+  for dep in "${deps[@]}"; do
+    command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+  done
+
+  if command -v ssh >/dev/null 2>&1 || command -v autossh >/dev/null 2>&1; then
+    :
+  else
+    missing+=("openssh-client")
+  fi
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    log "Linux dependencies already installed"
+    return
+  fi
+
+  if ! can_use_sudo && [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    log "Missing dependencies: ${missing[*]}"
+    log "No non-interactive sudo available; skipping package install. If setup fails, install: ${missing[*]}"
+    return
+  fi
+
   if command -v apt-get >/dev/null 2>&1; then
-    with_sudo apt-get update
-    with_sudo apt-get install -y curl jq openssh-client autossh git
+    log "Installing dependencies with apt-get: curl jq openssh-client autossh git"
+    with_sudo apt-get update || log "apt-get update failed; continuing with existing package metadata"
+    with_sudo apt-get install -y curl jq openssh-client autossh git || log "apt-get install failed; continuing and will report missing commands later"
   elif command -v dnf >/dev/null 2>&1; then
-    with_sudo dnf install -y curl jq openssh-clients autossh git
+    log "Installing dependencies with dnf: curl jq openssh-clients autossh git"
+    with_sudo dnf install -y curl jq openssh-clients autossh git || log "dnf install failed; continuing and will report missing commands later"
   elif command -v pacman >/dev/null 2>&1; then
-    with_sudo pacman -Sy --noconfirm curl jq openssh autossh git
+    log "Installing dependencies with pacman: curl jq openssh autossh git"
+    with_sudo pacman -Sy --noconfirm curl jq openssh autossh git || log "pacman install failed; continuing and will report missing commands later"
   else
     log "No supported package manager detected; install curl/jq/openssh/autossh/git manually"
   fi
