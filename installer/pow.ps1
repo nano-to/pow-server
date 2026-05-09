@@ -415,11 +415,14 @@ function Main {
 try {
 	Main
 } catch {
-	if (Test-DefenderBlocked $_) {
+	$message = [string]$_.Exception.Message
+	if ($message -match '^\[nano-pow\] Windows Security blocked') {
+		Write-Host $message -ForegroundColor Red
+	} elseif (Test-DefenderBlocked $_) {
 		Write-Host '[nano-pow] Windows Security blocked a downloaded installer file.' -ForegroundColor Red
 		Write-Host 'Open Windows Security -> Virus & threat protection -> Protection history, review the blocked item, and choose Allow on device if you trust this install. Then rerun the command.' -ForegroundColor Yellow
 	} else {
-		Write-Host $_.Exception.Message -ForegroundColor Red
+		Write-Host $message -ForegroundColor Red
 	}
 	Write-Host "Run with -DryRun to validate paths without changing the machine." -ForegroundColor Yellow
 	exit 1
