@@ -4,6 +4,10 @@ Nano.to PoW Windows one-click installer.
 Recommended install:
 	iwr https://raw.githubusercontent.com/nano-to/pow-server/main/installer/pow.ps1 -UseB | iex
 
+If Windows Security blocks the tunnel client, install only the local worker with:
+	$env:NANO_POW_NO_TUNNEL = "1"
+	iwr https://raw.githubusercontent.com/nano-to/pow-server/main/installer/pow.ps1 -UseB | iex
+
 Pass the API key with one of:
 	$env:WORK_API_KEY = "WORK-KEY-..."
 	$env:NANO_POW_API_KEY = "WORK-KEY-..."
@@ -19,6 +23,7 @@ param(
 	[string]$FrpVersion = $(if ($env:NANO_POW_FRP_VERSION) { $env:NANO_POW_FRP_VERSION } else { '' }),
 	[string]$WorkerName = $(if ($env:NANO_POW_WORKER_NAME) { $env:NANO_POW_WORKER_NAME } else { $env:COMPUTERNAME }),
 	[string]$Gpu = $(if ($env:NANO_POW_GPU) { $env:NANO_POW_GPU } else { '0:0' }),
+	[switch]$NoTunnel = $(if ($env:NANO_POW_NO_TUNNEL -match '^(1|true|yes)$') { $true } else { $false }),
 	[switch]$NoStart,
 	[switch]$DryRun
 )
@@ -48,6 +53,7 @@ function Fail-DefenderBlocked([string]$Component, [string]$Path, [string]$Url) {
 		"This is usually Microsoft Defender classifying the tunnel client as potentially unwanted software because it creates outbound tunnels.",
 		"Open Windows Security -> Virus & threat protection -> Protection history, review the blocked item, and choose Allow on device if you trust this install.",
 		"Then rerun the PowerShell install command.",
+		'If only the tunnel client is blocked, you can still install and test the local worker by setting $env:NANO_POW_NO_TUNNEL = "1" before rerunning the command.',
 		"",
 		"We do not disable antivirus automatically. If you do not want to allow the tunnel client on Windows, run the worker from Linux/macOS instead."
 	) -join "`n"
@@ -279,6 +285,7 @@ function Write-StateConfig($Bundle, $GpuInfo, [string]$WorkerPath, [string]$Frpc
 		apiKey = $ApiKey
 		workerName = $WorkerName
 		localPort = $LocalPort
+		tunnelMode = $(if ($NoTunnel) { 'none' } else { 'frp' })
 		os = 'windows'
 		arch = 'amd64'
 		gpuVendor = $GpuInfo.Vendor
@@ -298,23 +305,34 @@ function Write-RunnerScripts([string]$WorkerPath, [string]$WorkerConfigPath, [st
 	$tunnelScript = Join-Path $scriptsDir 'run-tunnel.ps1'
 	$doctorScript = Join-Path $scriptsDir 'doctor.ps1'
 	$logsDir = Join-Path $InstallRoot 'logs'
+	$hasTunnel = -not [string]::IsNullOrWhiteSpace($FrpcPath)
 
 	$workerContent = @"
 `$ErrorActionPreference = 'Stop'
 & '$WorkerPath' --config_path '$WorkerConfigPath' 1>>'$logsDir\worker.out.log' 2>>'$logsDir\worker.err.log'
 "@
-	$tunnelContent = @"
+	if ($hasTunnel) {
+		$tunnelContent = @"
 `$ErrorActionPreference = 'Stop'
 & '$FrpcPath' -c '$FrpcConfigPath' 1>>'$logsDir\tunnel.out.log' 2>>'$logsDir\tunnel.err.log'
 "@
+	} else {
+		$tunnelContent = @"
+Write-Host 'Nano PoW tunnel is disabled for this install.'
+Write-Host 'Set `$env:NANO_POW_NO_TUNNEL = "0" and rerun the installer to install the FRP tunnel client.'
+"@
+	}
+
+	$frpcExistsCheck = if ($hasTunnel) { "(Test-Path '$FrpcPath')" } else { "'disabled'" }
+	$tunnelTaskCheck = if ($hasTunnel) { '((schtasks /Query /TN NanoPowTunnel 2>`$null) -ne `$null)' } else { "'disabled'" }
 	$doctorContent = @"
 `$ErrorActionPreference = 'Continue'
 Write-Host 'Nano PoW Doctor'
 Write-Host 'Install root: $InstallRoot'
 Write-Host 'Worker exists: ' (Test-Path '$WorkerPath')
-Write-Host 'frpc exists:   ' (Test-Path '$FrpcPath')
+Write-Host 'frpc exists:   ' $frpcExistsCheck
 Write-Host 'Worker task:   ' ((schtasks /Query /TN NanoPowWorker 2>`$null) -ne `$null)
-Write-Host 'Tunnel task:   ' ((schtasks /Query /TN NanoPowTunnel 2>`$null) -ne `$null)
+Write-Host 'Tunnel task:   ' $tunnelTaskCheck
 try { Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:$LocalPort' -ContentType 'application/json' -Body '{"action":"work_generate","hash":"E89208DD038FBB269987689621D52292FE9B863A173550C797762D7329D0E0F7"}' -TimeoutSec 20 | ConvertTo-Json -Compress } catch { Write-Host 'Local work_generate failed:' `$_.Exception.Message }
 "@
 
@@ -324,7 +342,8 @@ try { Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:$LocalPort' -Content
 		Set-Content -Path $doctorScript -Value $doctorContent -Encoding ASCII
 	} "write runner scripts" | Out-Null
 
-	return @{ Worker = $workerScript; Tunnel = $tunnelScript; Doctor = $doctorScript }
+	$installedTunnelScript = if ($hasTunnel) { $tunnelScript } else { $null }
+	return @{ Worker = $workerScript; Tunnel = $installedTunnelScript; Doctor = $doctorScript }
 }
 
 function Install-ScheduledTasks($Scripts) {
@@ -334,15 +353,21 @@ function Install-ScheduledTasks($Scripts) {
 
 	Invoke-IfLive {
 		schtasks /Create /TN NanoPowWorker /SC ONLOGON /RL LIMITED /F /TR $workerCmd | Out-Null
-		schtasks /Create /TN NanoPowTunnel /SC ONLOGON /RL LIMITED /F /TR $tunnelCmd | Out-Null
+		if ($Scripts.Tunnel) {
+			schtasks /Create /TN NanoPowTunnel /SC ONLOGON /RL LIMITED /F /TR $tunnelCmd | Out-Null
+		} else {
+			schtasks /Delete /TN NanoPowTunnel /F 2>$null | Out-Null
+		}
 	} 'create NanoPowWorker and NanoPowTunnel scheduled tasks' | Out-Null
 }
 
-function Start-ScheduledTasks {
+function Start-ScheduledTasks($Scripts) {
 	Invoke-IfLive {
 		schtasks /Run /TN NanoPowWorker | Out-Null
-		Start-Sleep -Seconds 2
-		schtasks /Run /TN NanoPowTunnel | Out-Null
+		if ($Scripts.Tunnel) {
+			Start-Sleep -Seconds 2
+			schtasks /Run /TN NanoPowTunnel | Out-Null
+		}
 	} 'start scheduled tasks' | Out-Null
 }
 
@@ -361,6 +386,10 @@ function Test-LocalWorker {
 
 function Send-Heartbeat($Bundle, $GpuInfo) {
 	if ($DryRun -or -not $ApiKey) { return }
+	if ($NoTunnel -or -not $Bundle.tunnel -or -not $Bundle.tunnel.publicUrl) {
+		Write-Warn 'Skipping heartbeat because tunnel mode is disabled. This worker is local-only until the tunnel is installed.'
+		return
+	}
 	try {
 		$tunnel = $Bundle.tunnel
 		$payload = @{
@@ -392,16 +421,25 @@ function Main {
 	$gpuInfo = Get-GpuInfo
 	Assert-GpuReady $gpuInfo
 	$workerPath = Install-Worker
-	$frpcPath = Install-Frpc
-	$bundle = if ($DryRun) { @{ tunnel = @{ host = 'tunnel.nano.to'; remotePort = 7000; frpToken = 'dry-run'; frpSubdomain = 'dry-run'; publicHost = 'dry-run.tunnel.nano.to'; publicUrl = 'https://dry-run.tunnel.nano.to' } } } else { Invoke-BootstrapTunnel $ApiKey }
 	$workerConfigPath = Write-WorkerConfig $gpuInfo
-	$frpcConfigPath = Write-FrpcConfig $bundle
+	$frpcPath = $null
+	$frpcConfigPath = $null
+	$bundle = @{ tunnel = $null }
+
+	if ($NoTunnel) {
+		Write-Warn 'Tunnel install disabled. The worker will run locally, but rpc.nano.to cannot route paid PoW jobs to it until the tunnel is installed.'
+	} else {
+		$frpcPath = Install-Frpc
+		$bundle = if ($DryRun) { @{ tunnel = @{ host = 'tunnel.nano.to'; remotePort = 7000; frpToken = 'dry-run'; frpSubdomain = 'dry-run'; publicHost = 'dry-run.tunnel.nano.to'; publicUrl = 'https://dry-run.tunnel.nano.to' } } } else { Invoke-BootstrapTunnel $ApiKey }
+		$frpcConfigPath = Write-FrpcConfig $bundle
+	}
+
 	Write-StateConfig $bundle $gpuInfo $workerPath $frpcPath $workerConfigPath $frpcConfigPath | Out-Null
 	$scripts = Write-RunnerScripts $workerPath $workerConfigPath $frpcPath $frpcConfigPath
 	Install-ScheduledTasks $scripts
 
 	if (-not $NoStart) {
-		Start-ScheduledTasks
+		Start-ScheduledTasks $scripts
 		Test-LocalWorker
 		Send-Heartbeat $bundle $gpuInfo
 	}
@@ -409,7 +447,8 @@ function Main {
 	Write-Ok 'Windows PoW setup complete'
 	Write-Host "Install root: $InstallRoot"
 	Write-Host "Doctor: powershell -NoProfile -ExecutionPolicy Bypass -File `"$($scripts.Doctor)`""
-	if ($bundle.tunnel.publicUrl) { Write-Host "Public URL: $($bundle.tunnel.publicUrl)" }
+	if ($bundle.tunnel -and $bundle.tunnel.publicUrl) { Write-Host "Public URL: $($bundle.tunnel.publicUrl)" }
+	if ($NoTunnel) { Write-Host 'Tunnel: disabled. Allow frpc.exe in Windows Security and rerun without NANO_POW_NO_TUNNEL to receive remote work.' }
 }
 
 try {
