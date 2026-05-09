@@ -31,6 +31,29 @@ function Write-Ok([string]$Message) { Write-Host "[nano-pow] $Message" -Foregrou
 function Write-Warn([string]$Message) { Write-Host "[nano-pow] WARNING: $Message" -ForegroundColor Yellow }
 function Fail([string]$Message) { throw "[nano-pow] $Message" }
 
+function Test-DefenderBlocked($ErrorRecord) {
+	$message = [string]$ErrorRecord.Exception.Message
+	if ($ErrorRecord.Exception.InnerException) {
+		$message += ' ' + [string]$ErrorRecord.Exception.InnerException.Message
+	}
+	return $message -match 'virus|potentially unwanted|0x800700E1|Operation did not complete successfully'
+}
+
+function Fail-DefenderBlocked([string]$Component, [string]$Path, [string]$Url) {
+	$details = @(
+		"Windows Security blocked $Component while installing nano-pow.",
+		"Path: $Path",
+		"Source: $Url",
+		"",
+		"This is usually Microsoft Defender classifying the tunnel client as potentially unwanted software because it creates outbound tunnels.",
+		"Open Windows Security -> Virus & threat protection -> Protection history, review the blocked item, and choose Allow on device if you trust this install.",
+		"Then rerun the PowerShell install command.",
+		"",
+		"We do not disable antivirus automatically. If you do not want to allow the tunnel client on Windows, run the worker from Linux/macOS instead."
+	) -join "`n"
+	Fail $details
+}
+
 function Invoke-IfLive([scriptblock]$Block, [string]$DryRunMessage) {
 	if ($DryRun) {
 		Write-Step "DRY-RUN: $DryRunMessage"
@@ -103,7 +126,16 @@ function New-InstallDirs {
 
 function Download-File([string]$Url, [string]$Path) {
 	Write-Step "Downloading $Url"
-	Invoke-IfLive { Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing } "download $Url to $Path" | Out-Null
+	Invoke-IfLive {
+		try {
+			Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing
+		} catch {
+			if (Test-DefenderBlocked $_) {
+				Fail-DefenderBlocked 'downloaded file' $Path $Url
+			}
+			throw
+		}
+	} "download $Url to $Path" | Out-Null
 }
 
 function Install-Worker {
@@ -119,12 +151,19 @@ function Install-Worker {
 
 	Download-File $WorkerArchiveUrl $archivePath
 	Invoke-IfLive {
-		Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
-		New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-		tar.exe -xzf $archivePath -C $extractDir
-		$exe = Get-ChildItem -Path $extractDir -Recurse -Filter 'nano_pow_server.exe' | Select-Object -First 1
-		if (-not $exe) { Fail 'Worker archive did not contain nano_pow_server.exe' }
-		Copy-Item -Force $exe.FullName $target
+		try {
+			Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
+			New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+			tar.exe -xzf $archivePath -C $extractDir
+			$exe = Get-ChildItem -Path $extractDir -Recurse -Filter 'nano_pow_server.exe' | Select-Object -First 1
+			if (-not $exe) { Fail 'Worker archive did not contain nano_pow_server.exe' }
+			Copy-Item -Force $exe.FullName $target
+		} catch {
+			if (Test-DefenderBlocked $_) {
+				Fail-DefenderBlocked 'nano_pow_server.exe' $target $WorkerArchiveUrl
+			}
+			throw
+		}
 	} "extract worker archive and install nano_pow_server.exe" | Out-Null
 
 	return $target
@@ -153,11 +192,18 @@ function Install-Frpc {
 
 	Download-File $url $zipPath
 	Invoke-IfLive {
-		Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
-		Expand-Archive -Force -Path $zipPath -DestinationPath $extractDir
-		$exe = Get-ChildItem -Path $extractDir -Recurse -Filter 'frpc.exe' | Select-Object -First 1
-		if (-not $exe) { Fail 'FRP archive did not contain frpc.exe' }
-		Copy-Item -Force $exe.FullName $target
+		try {
+			Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
+			Expand-Archive -Force -Path $zipPath -DestinationPath $extractDir
+			$exe = Get-ChildItem -Path $extractDir -Recurse -Filter 'frpc.exe' | Select-Object -First 1
+			if (-not $exe) { Fail 'FRP archive did not contain frpc.exe' }
+			Copy-Item -Force $exe.FullName $target
+		} catch {
+			if (Test-DefenderBlocked $_) {
+				Fail-DefenderBlocked 'frpc.exe tunnel client' $target $url
+			}
+			throw
+		}
 	} "extract frpc.exe" | Out-Null
 
 	return $target
@@ -369,7 +415,12 @@ function Main {
 try {
 	Main
 } catch {
-	Write-Host $_.Exception.Message -ForegroundColor Red
+	if (Test-DefenderBlocked $_) {
+		Write-Host '[nano-pow] Windows Security blocked a downloaded installer file.' -ForegroundColor Red
+		Write-Host 'Open Windows Security -> Virus & threat protection -> Protection history, review the blocked item, and choose Allow on device if you trust this install. Then rerun the command.' -ForegroundColor Yellow
+	} else {
+		Write-Host $_.Exception.Message -ForegroundColor Red
+	}
 	Write-Host "Run with -DryRun to validate paths without changing the machine." -ForegroundColor Yellow
 	exit 1
 }
